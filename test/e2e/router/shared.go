@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -33,6 +34,7 @@ import (
 	workloadv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 	backendmetrics "github.com/volcano-sh/kthena/pkg/kthena-router/backend/metrics"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/backend/sglang"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/scheduler/plugins"
 	routerutils "github.com/volcano-sh/kthena/pkg/kthena-router/utils"
 	routercontext "github.com/volcano-sh/kthena/test/e2e/router/context"
 	"github.com/volcano-sh/kthena/test/e2e/utils"
@@ -1583,5 +1585,215 @@ func TestRateLimitMetricsShared(t *testing.T, testCtx *routercontext.RouterTestC
 
 			return rateLimitDelta == float64(rateLimitedCount) && requestDelta == float64(rateLimitedCount)
 		}, 15*time.Second, time.Second, "Rate limit metrics did not match expected values")
+	})
+}
+
+// TestRouterConfigUpdateShared is a shared test function that can be used by both
+// router and gateway-api test suites. When useGatewayAPI is true, it configures ModelRoute
+// with ParentRefs to the default Gateway.
+func TestRouterConfigUpdateShared(t *testing.T, testCtx *routercontext.RouterTestContext, testNamespace string, useGatewayAPI bool, kthenaNamespace string) {
+	ctx := context.Background()
+	const configMapName = "kthena-router-config"
+	const routerDeploymentName = "kthena-router"
+	const routerConfigKey = "routerConfiguration"
+
+	// Deploy ModelRoute
+	t.Log("Deploying ModelRoute...")
+
+	modelRoute := utils.LoadYAMLFromFile[networkingv1alpha1.ModelRoute](filepath.Join(routercontext.TestDataDir, "ModelRouteSimple.yaml"))
+	modelRoute.Namespace = testNamespace
+
+	// Configure ParentRefs if using Gateway API
+	setupModelRouteWithGatewayAPI(modelRoute, useGatewayAPI, kthenaNamespace)
+
+	createdModelRoute, err := testCtx.KthenaClient.NetworkingV1alpha1().ModelRoutes(testNamespace).Create(ctx, modelRoute, metav1.CreateOptions{})
+	require.NoError(t, err, "Failed to create ModelRoute")
+	assert.NotNil(t, createdModelRoute)
+	t.Logf("Created ModelRoute: %s/%s", createdModelRoute.Namespace, createdModelRoute.Name)
+
+	// Register cleanup function to delete ModelRoute after test completes
+	t.Cleanup(func() {
+		cleanupCtx := context.Background()
+		t.Logf("Cleaning up ModelRoute: %s/%s", createdModelRoute.Namespace, createdModelRoute.Name)
+		if err := testCtx.KthenaClient.NetworkingV1alpha1().ModelRoutes(testNamespace).Delete(cleanupCtx, createdModelRoute.Name, metav1.DeleteOptions{}); err != nil {
+			t.Logf("Warning: Failed to delete ModelRoute %s/%s: %v", createdModelRoute.Namespace, createdModelRoute.Name, err)
+		}
+	})
+
+	messages := []utils.ChatMessage{
+		utils.NewChatMessage("user", "Hello"),
+	}
+
+	// Verify routing works with the initial (default) config.
+	t.Run("VerifyInitialConfig", func(t *testing.T) {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err, "Failed to find an available port")
+		initialRouterPort := fmt.Sprintf("%d", listener.Addr().(*net.TCPAddr).Port)
+		listener.Close()
+
+		pf, err := utils.SetupPortForward(kthenaNamespace, routerDeploymentName, initialRouterPort, "80")
+		require.NoError(t, err, "Failed to setup initial port-forward")
+		defer pf.Close()
+
+		initialRouterURL := fmt.Sprintf("http://127.0.0.1:%s/v1/chat/completions", initialRouterPort)
+
+		resp := utils.CheckChatCompletionsWithURL(t, initialRouterURL, modelRoute.Spec.ModelName, messages)
+		assert.Equal(t, 200, resp.StatusCode, "Routing should work with initial config")
+	})
+
+	// Save the original ConfigMap data for restoration after test.
+	cm, err := testCtx.KubeClient.CoreV1().ConfigMaps(kthenaNamespace).Get(ctx, configMapName, metav1.GetOptions{})
+	require.NoError(t, err, "Failed to get router ConfigMap")
+	originalConfigData := cm.Data[routerConfigKey]
+	require.NotEmpty(t, originalConfigData, "Router configuration should not be empty")
+
+	// Derive the pod label selector and expected replicas from the router deployment.
+	routerDeploy, err := testCtx.KubeClient.AppsV1().Deployments(kthenaNamespace).Get(ctx, routerDeploymentName, metav1.GetOptions{})
+	require.NoError(t, err, "Failed to get router deployment")
+	routerPodSelector := metav1.FormatLabelSelector(routerDeploy.Spec.Selector)
+	expectedReplicas := int32(1)
+	if routerDeploy.Spec.Replicas != nil {
+		expectedReplicas = *routerDeploy.Spec.Replicas
+	}
+
+	// Register cleanup to restore original ConfigMap, restart router, and
+	// re-establish port-forward for subsequent tests.
+	t.Cleanup(func() {
+		cleanupCtx := context.Background()
+		t.Log("Restoring original router ConfigMap...")
+
+		latestCM, err := testCtx.KubeClient.CoreV1().ConfigMaps(kthenaNamespace).Get(cleanupCtx, configMapName, metav1.GetOptions{})
+		if err != nil {
+			t.Logf("Warning: Failed to get ConfigMap for restoration: %v", err)
+			return
+		}
+		latestCM.Data[routerConfigKey] = originalConfigData
+		if _, err := testCtx.KubeClient.CoreV1().ConfigMaps(kthenaNamespace).Update(cleanupCtx, latestCM, metav1.UpdateOptions{}); err != nil {
+			t.Logf("Warning: Failed to restore original ConfigMap: %v", err)
+			return
+		}
+
+		// Delete router pods so the deployment controller recreates them with the restored config.
+		pods, err := testCtx.KubeClient.CoreV1().Pods(kthenaNamespace).List(cleanupCtx, metav1.ListOptions{
+			LabelSelector: routerPodSelector,
+		})
+		if err != nil {
+			t.Logf("Warning: Failed to list router pods for cleanup: %v", err)
+			return
+		}
+		for i := range pods.Items {
+			_ = testCtx.KubeClient.CoreV1().Pods(kthenaNamespace).Delete(cleanupCtx, pods.Items[i].Name, metav1.DeleteOptions{})
+		}
+
+		// Wait for the router to become ready with the restored config.
+		_ = utils.WaitForDeploymentReadyE(cleanupCtx, testCtx.KubeClient, kthenaNamespace, routerDeploymentName, defaultScalingTimeout)
+	})
+
+	// Update the ConfigMap with a new scheduler configuration:
+	// use only least-request as score plugin (remove gpu-usage, least-latency, prefix-cache)
+	// and increase maxWaitingRequests from 10 to 100.
+	updatedConfig := `scheduler:
+  pluginConfig:
+  - name: least-request
+    args:
+      maxWaitingRequests: 100
+  plugins:
+    Filter:
+      enabled:
+        - least-request
+    Score:
+      enabled:
+        - name: least-request
+          weight: 1`
+
+	// Re-fetch the ConfigMap to get the latest ResourceVersion and avoid optimistic concurrency conflicts.
+	cm, err = testCtx.KubeClient.CoreV1().ConfigMaps(kthenaNamespace).Get(ctx, configMapName, metav1.GetOptions{})
+	require.NoError(t, err, "Failed to re-fetch router ConfigMap")
+	t.Log("Updating router ConfigMap with new scheduler configuration...")
+	cm.Data[routerConfigKey] = updatedConfig
+	_, err = testCtx.KubeClient.CoreV1().ConfigMaps(kthenaNamespace).Update(ctx, cm, metav1.UpdateOptions{})
+	require.NoError(t, err, "Failed to update router ConfigMap")
+
+	// Record pre-restart pod names to confirm they get replaced.
+	preRestartPods := utils.GetReadyRouterPods(t, testCtx.KubeClient, kthenaNamespace)
+	preRestartPodNames := make(map[string]bool, len(preRestartPods))
+	for _, pod := range preRestartPods {
+		preRestartPodNames[pod.Name] = true
+	}
+
+	// Delete router pods so the deployment controller recreates them with the updated config.
+	t.Log("Deleting router pods to trigger restart...")
+	for _, pod := range preRestartPods {
+		err := testCtx.KubeClient.CoreV1().Pods(kthenaNamespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
+		require.NoError(t, err, "Failed to delete router pod %s", pod.Name)
+	}
+
+	// Wait for pre-restart pods to be replaced by new ones.
+	require.Eventually(t, func() bool {
+		pods, err := testCtx.KubeClient.CoreV1().Pods(kthenaNamespace).List(ctx, metav1.ListOptions{
+			LabelSelector: routerPodSelector,
+		})
+		if err != nil {
+			return false
+		}
+		for _, pod := range pods.Items {
+			if preRestartPodNames[pod.Name] {
+				return false
+			}
+		}
+		return len(pods.Items) > 0
+	}, defaultScalingTimeout, 2*time.Second, "Pre-restart pods should be replaced")
+
+	// Wait for the deployment to be ready with the new pods.
+	utils.WaitForDeploymentReady(t, ctx, testCtx.KubeClient, kthenaNamespace, routerDeploymentName, expectedReplicas, defaultScalingTimeout)
+	t.Log("Router deployment is ready after restart")
+
+	// Set up port-forward to the restarted router on a dynamically selected local port
+	// to avoid conflicts with the framework port-forward on 8080 and other parallel tests.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err, "Failed to find an available port")
+	restartedRouterPort := fmt.Sprintf("%d", listener.Addr().(*net.TCPAddr).Port)
+	listener.Close()
+
+	pf, err := utils.SetupPortForward(kthenaNamespace, routerDeploymentName, restartedRouterPort, "80")
+	require.NoError(t, err, "Failed to setup port-forward to restarted router")
+	defer pf.Close()
+
+	restartedRouterURL := fmt.Sprintf("http://127.0.0.1:%s/v1/chat/completions", restartedRouterPort)
+	restartedMetricsURL := fmt.Sprintf("http://127.0.0.1:%s/metrics", restartedRouterPort)
+
+	// Verify routing works after config update and restart.
+	t.Run("VerifyUpdatedConfig", func(t *testing.T) {
+		resp := utils.CheckChatCompletionsWithURL(t, restartedRouterURL, modelRoute.Spec.ModelName, messages)
+		assert.Equal(t, 200, resp.StatusCode, "Routing should work after config update and restart")
+	})
+
+	// Verify the updated config took effect by checking scheduler plugin metrics.
+	// After restart, only the configured score plugins should appear in metrics.
+	t.Run("VerifyPluginMetricsAfterConfigUpdate", func(t *testing.T) {
+		// With the updated config, only "least-request" should be active as a score plugin.
+		require.Eventually(t, func() bool {
+			metricsData, err := backendmetrics.ParseMetricsURL(restartedMetricsURL)
+			if err != nil {
+				return false
+			}
+			activeCount := getHistogramCount(metricsData, "kthena_router_scheduler_plugin_duration_seconds", map[string]string{
+				"plugin": plugins.LeastRequestPluginName,
+				"type":   "score",
+			})
+			return activeCount > 0
+		}, 30*time.Second, time.Second, "Expected least-request score plugin to be active in metrics")
+
+		metricsData, err := backendmetrics.ParseMetricsURL(restartedMetricsURL)
+		require.NoError(t, err, "Failed to fetch metrics after config update")
+
+		// Removed plugins should not appear in fresh metrics after restart.
+		for _, removedPlugin := range []string{plugins.PrefixCachePluginName, plugins.GPUCacheUsagePluginName, plugins.LeastLatencyPluginName} {
+			count := getHistogramCount(metricsData, "kthena_router_scheduler_plugin_duration_seconds", map[string]string{
+				"plugin": removedPlugin,
+				"type":   "score",
+			})
+			assert.Equal(t, uint64(0), count, "Plugin %q should not be active after config update", removedPlugin)
+		}
 	})
 }

@@ -124,3 +124,49 @@ func WaitForPodLogsContain(
 		t.Logf("%s", sub)
 	}
 }
+
+// DumpRouterPodLogsSince logs recent logs from all router pods.
+// It is intended for diagnostics in failing e2e tests and avoids failing the test on log collection errors.
+func DumpRouterPodLogsSince(t *testing.T, kubeClient kubernetes.Interface, namespace string, since time.Duration) {
+	t.Helper()
+	ctx := context.Background()
+
+	deployment, err := kubeClient.AppsV1().Deployments(namespace).Get(ctx, "kthena-router", metav1.GetOptions{})
+	if err != nil {
+		t.Logf("Skipping router log dump: failed to get kthena-router deployment in namespace %q: %v", namespace, err)
+		return
+	}
+
+	labelSelector := ""
+	for key, value := range deployment.Spec.Selector.MatchLabels {
+		if labelSelector != "" {
+			labelSelector += ","
+		}
+		labelSelector += key + "=" + value
+	}
+
+	pods, err := kubeClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: labelSelector})
+	if err != nil {
+		t.Logf("Skipping router log dump: failed to list router pods in namespace %q: %v", namespace, err)
+		return
+	}
+	if len(pods.Items) == 0 {
+		t.Logf("Skipping router log dump: no router pods found in namespace %q", namespace)
+		return
+	}
+
+	sec := int64(since.Seconds())
+	for _, pod := range pods.Items {
+		t.Logf("===== Router logs begin: %s/%s (since=%s) =====", namespace, pod.Name, since)
+		logs, err := kubeClient.CoreV1().Pods(namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
+			SinceSeconds: &sec,
+		}).Do(ctx).Raw()
+		if err != nil {
+			t.Logf("Failed to get logs for router pod %s/%s: %v", namespace, pod.Name, err)
+			t.Logf("===== Router logs end: %s/%s =====", namespace, pod.Name)
+			continue
+		}
+		t.Logf("%s", string(logs))
+		t.Logf("===== Router logs end: %s/%s =====", namespace, pod.Name)
+	}
+}

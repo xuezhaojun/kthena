@@ -440,6 +440,13 @@ func TestModelRoutePrefillDecodeDisaggregationShared(t *testing.T, testCtx *rout
 // the same end-to-end flow as vLLM PD tests. When useGatewayAPI is true, it configures ModelRoute
 // with ParentRefs to the default Gateway.
 func TestModelRouteSglangPrefillDecodeDisaggregationShared(t *testing.T, testCtx *routercontext.RouterTestContext, testNamespace string, useGatewayAPI bool, kthenaNamespace string) {
+	t.Cleanup(func() {
+		if !t.Failed() || kthenaNamespace == "" {
+			return
+		}
+		utils.DumpRouterPodLogsSince(t, testCtx.KubeClient, kthenaNamespace, 10*time.Minute)
+	})
+
 	testModelRoutePrefillDecodeDisaggregationSharedWithFixtures(
 		t, testCtx, testNamespace, useGatewayAPI, kthenaNamespace,
 		pdDisaggregationFixtures{

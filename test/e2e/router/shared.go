@@ -95,6 +95,14 @@ func matchLabels(metricLabels []*dto.LabelPair, wantLabels map[string]string) bo
 	return true
 }
 
+// WaitForKthenaRouterValidatingWebhook polls until a DryRun ModelRoute create reaches the
+// validating webhook (avoids flaky tests while cert-manager / deployment finishes).
+//
+// The validating webhook is served by the kthena-router pod itself, not a separate
+// deployment. TestRouterConfigUpdate deliberately restarts the kthena-router pod before
+// this test runs. Kubernetes can mark the pod Ready before the webhook handler is fully
+// initialised, so we retry all transient connection errors until the webhook is stable.
+
 func ensureRedis(t *testing.T, kubeClient kubernetes.Interface, namespace string) func() {
 	t.Helper()
 	ctx := context.Background()
@@ -1770,6 +1778,7 @@ func TestRouterConfigUpdateShared(t *testing.T, testCtx *routercontext.RouterTes
 
 	// Verify routing works after config update and restart.
 	WaitForKthenaRouterValidatingWebhook(t, ctx, testCtx.KthenaClient, kthenaNamespace)
+
 	t.Run("VerifyUpdatedConfig", func(t *testing.T) {
 		resp := utils.CheckChatCompletionsWithURL(t, restartedRouterURL, modelRoute.Spec.ModelName, messages)
 		assert.Equal(t, 200, resp.StatusCode, "Routing should work after config update and restart")

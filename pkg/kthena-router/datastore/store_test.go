@@ -35,6 +35,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
 // ptr is a helper function to get pointer to a value
@@ -1899,4 +1900,254 @@ func TestMatchModelServer_EmptyTargetModels_FallsThrough(t *testing.T) {
 	server, _, _, err := s.MatchModelServer("my-model", req, "")
 	assert.NoError(t, err)
 	assert.Equal(t, types.NamespacedName{Namespace: "default", Name: "good-server"}, server)
+}
+
+// newStoreWithGateway is a helper that builds a store pre-populated with a Gateway.
+func newStoreWithGateway(gatewayNamespace, gatewayName string, listeners []gatewayv1.Listener) *store {
+	s := &store{
+		routeInfo:          make(map[string]*modelRouteInfo),
+		routes:             make(map[string][]*aiv1alpha1.ModelRoute),
+		loraRoutes:         make(map[string][]*aiv1alpha1.ModelRoute),
+		gatewayModelRoutes: make(map[string]sets.Set[string]),
+		gateways:           make(map[string]*gatewayv1.Gateway),
+		callbacks:          make(map[string][]CallbackFunc),
+	}
+	gw := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: gatewayNamespace,
+			Name:      gatewayName,
+		},
+		Spec: gatewayv1.GatewaySpec{
+			Listeners: listeners,
+		},
+	}
+	s.AddOrUpdateGateway(gw)
+	return s
+}
+
+// makeModelRoute is a helper that builds a ModelRoute with a single rule pointing to a model server.
+func makeModelRoute(namespace, name, modelName, serverName string, parentRefs []gatewayv1.ParentReference) *aiv1alpha1.ModelRoute {
+	return &aiv1alpha1.ModelRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      name,
+		},
+		Spec: aiv1alpha1.ModelRouteSpec{
+			ModelName:  modelName,
+			ParentRefs: parentRefs,
+			Rules: []*aiv1alpha1.Rule{
+				{
+					Name: "default-rule",
+					TargetModels: []*aiv1alpha1.TargetModel{
+						{
+							ModelServerName: serverName,
+							Weight:          ptr(uint32(100)),
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func TestMatchModelServer_WithGatewayKey_RouteMatchesCorrectGateway(t *testing.T) {
+	s := newStoreWithGateway("default", "my-gateway", []gatewayv1.Listener{
+		{Name: "http"},
+	})
+
+	kind := gatewayv1.Kind("Gateway")
+	mr := makeModelRoute("default", "route-a", "llama3", "llama3-server", []gatewayv1.ParentReference{
+		{Name: "my-gateway", Kind: &kind},
+	})
+	assert.NoError(t, s.AddOrUpdateModelRoute(mr))
+
+	req := &http.Request{URL: &url.URL{Path: "/v1/chat/completions"}}
+	server, isLora, route, err := s.MatchModelServer("llama3", req, "default/my-gateway")
+
+	assert.NoError(t, err)
+	assert.False(t, isLora)
+	assert.Equal(t, "llama3-server", server.Name)
+	assert.NotNil(t, route)
+}
+
+func TestMatchModelServer_WithGatewayKey_RouteSkippedForDifferentGateway(t *testing.T) {
+	s := newStoreWithGateway("default", "gateway-a", []gatewayv1.Listener{
+		{Name: "http"},
+	})
+	// Also add gateway-b so it exists in the store
+	gwB := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gateway-b"},
+		Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "http"}}},
+	}
+	s.AddOrUpdateGateway(gwB)
+
+	kind := gatewayv1.Kind("Gateway")
+	mr := makeModelRoute("default", "route-a", "llama3", "llama3-server", []gatewayv1.ParentReference{
+		{Name: "gateway-a", Kind: &kind},
+	})
+	assert.NoError(t, s.AddOrUpdateModelRoute(mr))
+
+	req := &http.Request{URL: &url.URL{Path: "/v1/chat/completions"}}
+	_, _, _, err := s.MatchModelServer("llama3", req, "default/gateway-b")
+
+	assert.Error(t, err, "route attached to gateway-a must not match gateway-b")
+}
+
+func TestMatchModelServer_WithGatewayKey_RouteWithoutParentRefsSkipped(t *testing.T) {
+	s := newStoreWithGateway("default", "my-gateway", []gatewayv1.Listener{
+		{Name: "http"},
+	})
+
+	// Route has no parentRefs — should be skipped when gatewayKey is non-empty
+	mr := makeModelRoute("default", "route-a", "llama3", "llama3-server", nil)
+	assert.NoError(t, s.AddOrUpdateModelRoute(mr))
+
+	req := &http.Request{URL: &url.URL{Path: "/v1/chat/completions"}}
+	_, _, _, err := s.MatchModelServer("llama3", req, "default/my-gateway")
+
+	assert.Error(t, err, "route without parentRefs must be skipped when gatewayKey is provided")
+}
+
+func TestMatchModelServer_EmptyGatewayKey_RouteWithoutParentRefsMatches(t *testing.T) {
+	s := &store{
+		routeInfo:          make(map[string]*modelRouteInfo),
+		routes:             make(map[string][]*aiv1alpha1.ModelRoute),
+		loraRoutes:         make(map[string][]*aiv1alpha1.ModelRoute),
+		gatewayModelRoutes: make(map[string]sets.Set[string]),
+		gateways:           make(map[string]*gatewayv1.Gateway),
+		callbacks:          make(map[string][]CallbackFunc),
+	}
+
+	// Route has no parentRefs — should match when gatewayKey is empty
+	mr := makeModelRoute("default", "route-a", "llama3", "llama3-server", nil)
+	assert.NoError(t, s.AddOrUpdateModelRoute(mr))
+
+	req := &http.Request{URL: &url.URL{Path: "/v1/chat/completions"}}
+	server, isLora, _, err := s.MatchModelServer("llama3", req, "")
+
+	assert.NoError(t, err)
+	assert.False(t, isLora)
+	assert.Equal(t, "llama3-server", server.Name)
+}
+
+func TestMatchModelServer_WithGatewayKey_GatewayNotInStore(t *testing.T) {
+	s := &store{
+		routeInfo:          make(map[string]*modelRouteInfo),
+		routes:             make(map[string][]*aiv1alpha1.ModelRoute),
+		loraRoutes:         make(map[string][]*aiv1alpha1.ModelRoute),
+		gatewayModelRoutes: make(map[string]sets.Set[string]),
+		gateways:           make(map[string]*gatewayv1.Gateway),
+		callbacks:          make(map[string][]CallbackFunc),
+	}
+
+	kind := gatewayv1.Kind("Gateway")
+	mr := makeModelRoute("default", "route-a", "llama3", "llama3-server", []gatewayv1.ParentReference{
+		{Name: "my-gateway", Kind: &kind},
+	})
+	assert.NoError(t, s.AddOrUpdateModelRoute(mr))
+
+	req := &http.Request{URL: &url.URL{Path: "/v1/chat/completions"}}
+	_, _, _, err := s.MatchModelServer("llama3", req, "default/my-gateway")
+
+	assert.Error(t, err, "should fail when gateway is not registered in store")
+}
+
+func TestMatchModelServer_WithGatewayKey_SectionNameMatchesListener(t *testing.T) {
+	s := newStoreWithGateway("default", "my-gateway", []gatewayv1.Listener{
+		{Name: "http"},
+		{Name: "https"},
+	})
+
+	kind := gatewayv1.Kind("Gateway")
+	sectionName := gatewayv1.SectionName("https")
+	mr := makeModelRoute("default", "route-a", "llama3", "llama3-server", []gatewayv1.ParentReference{
+		{Name: "my-gateway", Kind: &kind, SectionName: &sectionName},
+	})
+	assert.NoError(t, s.AddOrUpdateModelRoute(mr))
+
+	req := &http.Request{URL: &url.URL{Path: "/v1/chat/completions"}}
+	server, _, _, err := s.MatchModelServer("llama3", req, "default/my-gateway")
+
+	assert.NoError(t, err)
+	assert.Equal(t, "llama3-server", server.Name)
+}
+
+func TestMatchModelServer_WithGatewayKey_SectionNameNoMatchingListener(t *testing.T) {
+	s := newStoreWithGateway("default", "my-gateway", []gatewayv1.Listener{
+		{Name: "http"},
+	})
+
+	kind := gatewayv1.Kind("Gateway")
+	sectionName := gatewayv1.SectionName("nonexistent-listener")
+	mr := makeModelRoute("default", "route-a", "llama3", "llama3-server", []gatewayv1.ParentReference{
+		{Name: "my-gateway", Kind: &kind, SectionName: &sectionName},
+	})
+	assert.NoError(t, s.AddOrUpdateModelRoute(mr))
+
+	req := &http.Request{URL: &url.URL{Path: "/v1/chat/completions"}}
+	_, _, _, err := s.MatchModelServer("llama3", req, "default/my-gateway")
+
+	assert.Error(t, err, "route with non-matching SectionName must not be selected")
+}
+
+func TestMatchModelServer_WithGatewayKey_LoraRouteGatewayScoped(t *testing.T) {
+	s := newStoreWithGateway("default", "my-gateway", []gatewayv1.Listener{
+		{Name: "http"},
+	})
+
+	kind := gatewayv1.Kind("Gateway")
+	mr := &aiv1alpha1.ModelRoute{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "lora-route"},
+		Spec: aiv1alpha1.ModelRouteSpec{
+			LoraAdapters: []string{"math-lora"},
+			ParentRefs:   []gatewayv1.ParentReference{{Name: "my-gateway", Kind: &kind}},
+			Rules: []*aiv1alpha1.Rule{
+				{
+					Name: "default-rule",
+					TargetModels: []*aiv1alpha1.TargetModel{
+						{ModelServerName: "lora-server", Weight: ptr(uint32(100))},
+					},
+				},
+			},
+		},
+	}
+	assert.NoError(t, s.AddOrUpdateModelRoute(mr))
+
+	req := &http.Request{URL: &url.URL{Path: "/v1/chat/completions"}}
+	server, isLora, _, err := s.MatchModelServer("math-lora", req, "default/my-gateway")
+
+	assert.NoError(t, err)
+	assert.True(t, isLora)
+	assert.Equal(t, "lora-server", server.Name)
+}
+
+func TestMatchModelServer_WithGatewayKey_MultipleRoutes_OnlyMatchingGatewaySelected(t *testing.T) {
+	s := newStoreWithGateway("default", "gateway-a", []gatewayv1.Listener{{Name: "http"}})
+	gwB := &gatewayv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "gateway-b"},
+		Spec:       gatewayv1.GatewaySpec{Listeners: []gatewayv1.Listener{{Name: "http"}}},
+	}
+	s.AddOrUpdateGateway(gwB)
+
+	kindA := gatewayv1.Kind("Gateway")
+	kindB := gatewayv1.Kind("Gateway")
+
+	mrA := makeModelRoute("default", "route-a", "llama3", "server-a", []gatewayv1.ParentReference{
+		{Name: "gateway-a", Kind: &kindA},
+	})
+	mrB := makeModelRoute("default", "route-b", "llama3", "server-b", []gatewayv1.ParentReference{
+		{Name: "gateway-b", Kind: &kindB},
+	})
+	assert.NoError(t, s.AddOrUpdateModelRoute(mrA))
+	assert.NoError(t, s.AddOrUpdateModelRoute(mrB))
+
+	req := &http.Request{URL: &url.URL{Path: "/v1/chat/completions"}}
+
+	serverA, _, _, err := s.MatchModelServer("llama3", req, "default/gateway-a")
+	assert.NoError(t, err)
+	assert.Equal(t, "server-a", serverA.Name)
+
+	serverB, _, _, err := s.MatchModelServer("llama3", req, "default/gateway-b")
+	assert.NoError(t, err)
+	assert.Equal(t, "server-b", serverB.Name)
 }

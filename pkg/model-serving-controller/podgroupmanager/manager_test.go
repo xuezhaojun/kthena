@@ -1410,3 +1410,121 @@ func TestUpdatePodGroupQueueBehavior(t *testing.T) {
 		assert.Equal(t, "", updated.Spec.Queue)
 	})
 }
+
+func newMinimalMSWithGroupTopology(mode string) *workloadv1alpha1.ModelServing {
+	ms := newMinimalMS("")
+	if mode == "" {
+		return ms
+	}
+	tier := 3
+	ms.Spec.Template.NetworkTopology = &workloadv1alpha1.NetworkTopology{
+		GroupPolicy: &schedulingv1beta1.NetworkTopologySpec{
+			Mode:               schedulingv1beta1.NetworkTopologyMode(mode),
+			HighestTierAllowed: &tier,
+		},
+	}
+	return ms
+}
+
+// TestUpdatePodGroupNetworkTopologyBehavior verifies that updatePodGroupIfNeeded syncs
+// Spec.NetworkTopology from ModelServing spec.template.networkTopology.groupPolicy.
+func TestUpdatePodGroupNetworkTopologyBehavior(t *testing.T) {
+	const (
+		oldMode = schedulingv1beta1.NetworkTopologyMode("old-mode")
+		newMode = schedulingv1beta1.NetworkTopologyMode("new-mode")
+	)
+
+	buildExistingPG := func(topology *schedulingv1beta1.NetworkTopologySpec) *schedulingv1beta1.PodGroup {
+		return &schedulingv1beta1.PodGroup{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-pg",
+				Namespace: "default",
+			},
+			Spec: schedulingv1beta1.PodGroupSpec{
+				MinMember:       1,
+				NetworkTopology: topology,
+			},
+		}
+	}
+
+	setupManager := func(existingPG *schedulingv1beta1.PodGroup) (*Manager, *volcanofake.Clientset) {
+		fakeVolcano := volcanofake.NewSimpleClientset(existingPG)
+		fakeApiext := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
+		mgr := NewManager(nil, fakeVolcano, fakeApiext, nil)
+		mgr.hasPodGroupCRD.Store(true)
+		mgr.hasSubGroupPolicy.Store(false)
+
+		indexer := cache.NewIndexer(
+			cache.MetaNamespaceKeyFunc,
+			cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+		)
+		err := indexer.Add(existingPG)
+		assert.NoError(t, err)
+		mgr.PodGroupLister = volcanoschedulerlister.NewPodGroupLister(indexer)
+		return mgr, fakeVolcano
+	}
+
+	tests := []struct {
+		name              string
+		existingTopology  *schedulingv1beta1.NetworkTopologySpec
+		groupTopologyMode string
+		wantTopologyNil   bool
+		wantTopologyMode  schedulingv1beta1.NetworkTopologyMode
+	}{
+		{
+			name: "groupPolicy change updates Spec.NetworkTopology",
+			existingTopology: &schedulingv1beta1.NetworkTopologySpec{
+				Mode: oldMode,
+			},
+			groupTopologyMode: "new-mode",
+			wantTopologyMode:  newMode,
+		},
+		{
+			name: "topology removed clears Spec.NetworkTopology",
+			existingTopology: &schedulingv1beta1.NetworkTopologySpec{
+				Mode: oldMode,
+			},
+			groupTopologyMode: "",
+			wantTopologyNil:   true,
+		},
+		{
+			name:              "topology added when absent sets Spec.NetworkTopology",
+			existingTopology:  nil,
+			groupTopologyMode: "new-mode",
+			wantTopologyMode:  newMode,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var existingTopology *schedulingv1beta1.NetworkTopologySpec
+			if tt.existingTopology != nil {
+				existingTopology = tt.existingTopology.DeepCopy()
+			}
+			pg := buildExistingPG(existingTopology)
+			mgr, fakeVolcano := setupManager(pg)
+
+			var ms *workloadv1alpha1.ModelServing
+			if tt.groupTopologyMode == "" {
+				ms = newMinimalMS("")
+			} else {
+				ms = newMinimalMSWithGroupTopology(tt.groupTopologyMode)
+			}
+
+			err := mgr.updatePodGroupIfNeeded(context.Background(), pg, ms)
+			assert.NoError(t, err)
+
+			updated, err := fakeVolcano.SchedulingV1beta1().PodGroups("default").Get(
+				context.Background(), "test-pg", metav1.GetOptions{})
+			assert.NoError(t, err)
+
+			if tt.wantTopologyNil {
+				assert.Nil(t, updated.Spec.NetworkTopology)
+				return
+			}
+			if assert.NotNil(t, updated.Spec.NetworkTopology) {
+				assert.Equal(t, tt.wantTopologyMode, updated.Spec.NetworkTopology.Mode)
+			}
+		})
+	}
+}

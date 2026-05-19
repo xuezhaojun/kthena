@@ -302,12 +302,7 @@ func (m *Manager) createPodGroup(ctx context.Context, ms *workloadv1alpha1.Model
 		podGroup.Spec.Queue = queue
 	}
 
-	if ms.Spec.Template.NetworkTopology != nil {
-		// set NetworkTopology if configured in ModelServing
-		if ms.Spec.Template.NetworkTopology.GroupPolicy != nil {
-			podGroup.Spec.NetworkTopology = ms.Spec.Template.NetworkTopology.GroupPolicy
-		}
-	}
+	syncPodGroupNetworkTopology(ms, &podGroup.Spec)
 
 	if m.hasSubGroupPolicy.Load() {
 		podGroup = appendSubGroupPolicy(ms, podGroup, minRoleMember)
@@ -455,6 +450,8 @@ func (m *Manager) updatePodGroupIfNeeded(ctx context.Context, existing *scheduli
 		// When the queue annotation is removed (or set to empty) queue field is set to empty string.
 		updated.Spec.Queue = extractQueueName(ms)
 
+		syncPodGroupNetworkTopology(ms, &updated.Spec)
+
 		// Apply network topology policy
 		if m.hasSubGroupPolicy.Load() {
 			updated = appendSubGroupPolicy(ms, updated, minRoleMember)
@@ -597,6 +594,16 @@ func podGroupCRDHasSubGroup(crd *apiextv1.CustomResourceDefinition) bool {
 		}
 	}
 	return false
+}
+
+// syncPodGroupNetworkTopology sets or clears PodGroup group-level NetworkTopology
+// from ModelServing spec.template.networkTopology.groupPolicy.
+func syncPodGroupNetworkTopology(ms *workloadv1alpha1.ModelServing, spec *schedulingv1beta1.PodGroupSpec) {
+	if ms.Spec.Template.NetworkTopology != nil && ms.Spec.Template.NetworkTopology.GroupPolicy != nil {
+		spec.NetworkTopology = ms.Spec.Template.NetworkTopology.GroupPolicy
+		return
+	}
+	spec.NetworkTopology = nil
 }
 
 func hasPodGroupChanged(current, updated *schedulingv1beta1.PodGroup) bool {

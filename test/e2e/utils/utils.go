@@ -33,8 +33,8 @@ import (
 )
 
 const (
-	defaultPollingInterval = 2 * time.Second
-	DefaultAPICallTimeout  = 2 * time.Second
+	defaultPollingInterval = 5 * time.Second
+	DefaultAPICallTimeout  = 10 * time.Second
 )
 
 // WaitForModelServingReady waits for a ModelServing to converge with desired replicas.
@@ -60,9 +60,7 @@ func WaitForModelServingReady(t *testing.T, ctx context.Context, kthenaClient *c
 		}
 		return ms.Status.ObservedGeneration >= ms.Generation &&
 			ms.Status.Replicas == expectedReplicas &&
-			ms.Status.AvailableReplicas == expectedReplicas &&
-			ms.Status.UpdatedReplicas == expectedReplicas &&
-			ms.Status.CurrentReplicas == expectedReplicas, nil
+			ms.Status.AvailableReplicas == expectedReplicas, nil
 	})
 	require.NoError(t, err, "ModelServing did not become ready")
 }

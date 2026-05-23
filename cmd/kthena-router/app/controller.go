@@ -112,7 +112,7 @@ func startControllers(store datastore.Store, stop <-chan struct{}, enableGateway
 		if err := ensureDefaultGateway(gatewayClient, defaultPort); err != nil {
 			klog.Fatalf("Failed to ensure default Gateway: %s", err.Error())
 		}
-
+		gatewayInformerFactory = gatewayinformers.NewSharedInformerFactory(gatewayClient, 0)
 		gatewayController, err = controller.NewGatewayController(gatewayInformerFactory, store)
 		if err != nil {
 			klog.Fatalf("Error creating gateway controller: %s", err.Error())
@@ -121,7 +121,6 @@ func startControllers(store datastore.Store, stop <-chan struct{}, enableGateway
 			gatewayInformerFactory.Gateway().V1().Gateways().Informer().HasSynced,
 			gatewayInformerFactory.Gateway().V1().HTTPRoutes().Informer().HasSynced,
 		)
-
 		if enableGatewayAPIInferenceExtension {
 			httpRouteController, err = controller.NewHTTPRouteController(gatewayInformerFactory, kubeInformerFactory, store)
 			if err != nil {
@@ -140,11 +139,6 @@ func startControllers(store datastore.Store, stop <-chan struct{}, enableGateway
 				kubeInformerFactory.Core().V1().Namespaces().Informer().HasSynced,
 				dynamicInformerFactory.ForResource(inferencev1.SchemeGroupVersion.WithResource("inferencepools")).Informer().HasSynced,
 			)
-			if err != nil {
-				klog.Fatalf("Error creating inferencepool controller: %s", err.Error())
-			}
-			cacheSyncs = append(cacheSyncs, dynamicInformerFactory.ForResource(inferencev1.SchemeGroupVersion.WithResource("inferencepools")).Informer().HasSynced)
-
 			dynamicInformerFactory.Start(stop)
 		}
 		gatewayInformerFactory.Start(stop)

@@ -178,12 +178,39 @@ func (s *SchedulerImpl) Schedule(ctx *framework.Context, pods []*datastore.PodIn
 		if validPairs == 0 {
 			return fmt.Errorf("no valid prefill-decode pod pairs found")
 		}
+
+		// Speculative pre-increment for PD mode: bump the on-flight counters
+		// for the first valid prefill-decode pair so concurrent Schedule()
+		// calls immediately see the updated load.
+		for i := range ctx.DecodePods {
+			if ctx.PrefillPods[i] != nil && ctx.DecodePods[i] != nil {
+				s.store.IncrPodOnFlightRequests(types.NamespacedName{
+					Namespace: ctx.PrefillPods[i].Pod.Namespace, Name: ctx.PrefillPods[i].Pod.Name})
+				s.store.IncrPodOnFlightRequests(types.NamespacedName{
+					Namespace: ctx.DecodePods[i].Pod.Namespace, Name: ctx.DecodePods[i].Pod.Name})
+				ctx.PreIncremented = true
+				ctx.PreIncrementedIdx = i
+				break
+			}
+		}
+
 		return nil
 	}
 
 	klog.V(4).Info("Running score plugins for PD aggregated pod")
 	scores := s.RunScorePlugins(pods, ctx)
 	ctx.BestPods = TopNPodInfos(scores, topN)
+
+	// Speculative pre-increment: immediately bump the on-flight counter for the
+	// top candidate so that the next concurrent Schedule() call sees the updated
+	// load, eliminating the TOCTOU race window between scoring and dispatching.
+	if len(ctx.BestPods) > 0 {
+		pod := ctx.BestPods[0]
+		podName := types.NamespacedName{Namespace: pod.Pod.Namespace, Name: pod.Pod.Name}
+		s.store.IncrPodOnFlightRequests(podName)
+		ctx.PreIncremented = true
+		ctx.PreIncrementedIdx = 0
+	}
 
 	return nil
 }

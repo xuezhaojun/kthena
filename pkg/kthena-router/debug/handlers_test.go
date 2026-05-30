@@ -176,6 +176,20 @@ func (m *MockStore) Enqueue(req *datastore.Request) error {
 	return args.Error(0)
 }
 
+func (m *MockStore) EnqueueSessionBoost(req *datastore.Request) (bool, error) {
+	args := m.Called(req)
+	return args.Bool(0), args.Error(1)
+}
+
+func (m *MockStore) GetSessionIDHeader() string {
+	args := m.Called()
+	return args.String(0)
+}
+
+func (m *MockStore) MarkSessionCompleted(modelName, correlationID string) {
+	m.Called(modelName, correlationID)
+}
+
 func (m *MockStore) GetRequestWaitingQueueStats() []datastore.QueueStat {
 	args := m.Called()
 	if args.Get(0) == nil {

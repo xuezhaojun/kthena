@@ -477,14 +477,6 @@ func createFairnessQueueConfig() FairnessQueueConfig {
 		}
 	}
 
-	if v := os.Getenv("FAIRNESS_INFLIGHT_PER_POD"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			cfg.InflightPerPod = n
-		} else {
-			klog.Warningf("Invalid FAIRNESS_INFLIGHT_PER_POD: %q, using default %d", v, cfg.InflightPerPod)
-		}
-	}
-
 	return cfg
 }
 
@@ -645,11 +637,7 @@ func (s *store) Enqueue(req *Request) error {
 	if ok {
 		queue, _ = val.(*RequestPriorityQueue)
 	} else {
-		// Create a backend waiting checker that polls all pods for waiting queue status.
-		// Only dequeue when at least one pod has an empty vLLM waiting queue.
-		checker := s.makeBackendWaitingChecker()
-		newQueue := NewRequestPriorityQueueWithConfig(nil, s.fairnessQueueConfig, s.tokenTracker, checker)
-		newQueue.SetPodCounter(s.makePodCounter())
+		newQueue := NewRequestPriorityQueueWithConfig(nil, s.fairnessQueueConfig, s.tokenTracker)
 		val, ok = s.requestWaitingQueue.LoadOrStore(modelName, newQueue)
 		if !ok {
 			queueCtx := s.rootCtx

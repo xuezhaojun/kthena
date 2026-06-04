@@ -29,6 +29,77 @@ import (
 	"github.com/volcano-sh/kthena/pkg/kthena-router/metrics"
 )
 
+// BackendWaitingChecker is a function that checks whether the backend pods
+// have capacity to accept new requests. It returns true when at least one pod
+// has an empty waiting queue (i.e. RequestWaitingNum == 0), meaning the backend
+// can accept a new request without queuing.
+type BackendWaitingChecker func() bool
+
+// SessionTracker tracks recently completed sessions for priority boosting.
+// It maps correlation IDs to their last completion time, allowing follow-up
+// requests in the same session to be prioritized for prefix cache utilization.
+type SessionTracker struct {
+	mu       sync.RWMutex
+	sessions map[string]time.Time // correlationID -> last completion time
+	ttl      time.Duration
+}
+
+// NewSessionTracker creates a new session tracker with the given TTL.
+func NewSessionTracker(ttl time.Duration) *SessionTracker {
+	return &SessionTracker{
+		sessions: make(map[string]time.Time),
+		ttl:      ttl,
+	}
+}
+
+// MarkCompleted records that a request from the given session has completed.
+func (st *SessionTracker) MarkCompleted(correlationID string) {
+	if correlationID == "" {
+		return
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.sessions[correlationID] = time.Now()
+}
+
+// HasRecentCompletion checks if the given correlation ID has a completion within the TTL window.
+func (st *SessionTracker) HasRecentCompletion(correlationID string) bool {
+	if correlationID == "" {
+		return false
+	}
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	completionTime, exists := st.sessions[correlationID]
+	if !exists {
+		return false
+	}
+	return time.Since(completionTime) <= st.ttl
+}
+
+// Cleanup removes expired sessions. Should be called periodically.
+func (st *SessionTracker) Cleanup() {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	now := time.Now()
+	expired := 0
+	for id, t := range st.sessions {
+		if now.Sub(t) > st.ttl {
+			delete(st.sessions, id)
+			expired++
+		}
+	}
+	if expired > 0 {
+		klog.V(4).Infof("[SessionTracker] cleanup: removed %d expired sessions, remaining=%d", expired, len(st.sessions))
+	}
+}
+
+// ActiveSessions returns the number of sessions currently tracked.
+func (st *SessionTracker) ActiveSessions() int {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	return len(st.sessions)
+}
+
 // SessionBoostQueueConfig holds configurable parameters for the standalone session boost queue.
 type SessionBoostQueueConfig struct {
 	// SessionIDHeader is the HTTP header name used to identify conversation sessions.

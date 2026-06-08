@@ -15,7 +15,7 @@ When session boost is enabled, the router does the following:
 1. Extracts the session identifier from the HTTP header configured via `SESSION_BOOST_HEADER` environment variable.
 2. Checks whether the same session completed a request recently (within TTL).
 3. If yes, marks the new request as **boosted** and promotes it ahead of non-boosted requests in the queue.
-4. After a request completes, enters a brief **grace period** to give a potential follow-up from the same session time to arrive.
+4. After a request completes, optionally enters a brief **grace period** (disabled by default) to give a potential follow-up from the same session time to arrive.
 
 ## When to Use Session Boost
 
@@ -51,7 +51,6 @@ networking:
       enabled: true
       header: "X-Session-ID"
       ttl: "60s"
-      gracePeriod: "50ms"
 ```
 
 Apply with Helm:
@@ -75,24 +74,24 @@ env:
   value: "X-Session-ID"
 - name: SESSION_BOOST_TTL
   value: "60s"
-- name: SESSION_BOOST_GRACE_PERIOD
-  value: "50ms"
+# - name: SESSION_BOOST_GRACE_PERIOD
+#   value: "50ms"              # Disabled by default; enable only if you understand the trade-off
 - name: SESSION_BOOST_POLL_INTERVAL
   value: "100ms"
-- name: SESSION_BOOST_INFLIGHT_PER_POD
-  value: "1"
+# - name: SESSION_BOOST_INFLIGHT_PER_POD
+#   value: "16"               # Tune based on your backend's concurrency capacity
 ```
 
 ## Configuration Reference
 
-| Environment Variable             | Purpose                                                                    | Default      | Notes                                                                                     |
-| -------------------------------- | -------------------------------------------------------------------------- | ------------ | ----------------------------------------------------------------------------------------- |
-| `ENABLE_SESSION_BOOST`           | Enable the session boost queue                                             | `false`      | Global feature switch                                                                     |
-| `SESSION_BOOST_HEADER`           | HTTP header used to identify conversation sessions                         | *(required)* | Must match what your clients send                                                         |
-| `SESSION_BOOST_TTL`              | Duration after which a session's boost expires                             | `60s`        | Longer values help slow human conversations; shorter values suit fast automated pipelines |
-| `SESSION_BOOST_GRACE_PERIOD`     | Wait time after a request completes for a same-session follow-up to arrive | `50ms`       | Increase for slower clients; set to `0` to disable                                        |
-| `SESSION_BOOST_POLL_INTERVAL`    | Backend capacity polling interval                                          | `100ms`      | Lower values reduce latency but increase polling load                                     |
-| `SESSION_BOOST_INFLIGHT_PER_POD` | Maximum inflight requests per backend pod                                  | `1`          | Increase if your backend handles concurrent requests efficiently                          |
+| Environment Variable             | Purpose                                                                    | Default      | Notes                                                                                                                        |
+| -------------------------------- | -------------------------------------------------------------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------- |
+| `ENABLE_SESSION_BOOST`           | Enable the session boost queue                                             | `false`      | Global feature switch                                                                                                        |
+| `SESSION_BOOST_HEADER`           | HTTP header used to identify conversation sessions                         | *(required)* | Must match what your clients send                                                                                            |
+| `SESSION_BOOST_TTL`              | Duration after which a session's boost expires                             | `60s`        | Longer values help slow human conversations; shorter values suit fast automated pipelines                                    |
+| `SESSION_BOOST_GRACE_PERIOD`     | Wait time after a request completes for a same-session follow-up to arrive | `0`          | Disabled by default. Only enable (e.g., `50ms`) if you understand the latency trade-off for non-boosted requests             |
+| `SESSION_BOOST_POLL_INTERVAL`    | Backend capacity polling interval                                          | `100ms`      | Lower values reduce latency but increase polling load                                                                        |
+| `SESSION_BOOST_INFLIGHT_PER_POD` | Maximum inflight requests per backend pod                                  | `16`         | Tune based on your backend's actual concurrency capacity (e.g., vLLM's `--max-num-seqs`). Lower values are more conservative |
 
 ## Client Integration
 
@@ -141,13 +140,15 @@ The session boost queue uses a simple two-level priority:
 
 ### Grace Period
 
-After a request completes, the queue briefly holds the dequeue slot for a potential follow-up from the same session:
+The grace period is **disabled by default** (`SESSION_BOOST_GRACE_PERIOD=0`). When disabled, the queue immediately dequeues the next request after a completion without waiting.
+
+When explicitly enabled (e.g., `SESSION_BOOST_GRACE_PERIOD=50ms`), the queue briefly holds the dequeue slot for a potential follow-up from the same session:
 
 - If a boosted request arrives during the grace period, it is dequeued immediately.
 - If no boosted request arrives before the grace period expires, the next non-boosted request proceeds normally.
 - If the head of the queue is already a boosted request, the grace period is skipped entirely.
 
-This mechanism is particularly useful for automated pipelines (RAG, agents) where follow-up requests arrive within milliseconds of the previous response.
+Only enable the grace period if you understand the trade-off: it adds latency to non-boosted requests in exchange for a higher chance of a same-session follow-up arriving in time. This is mainly useful for fast automated pipelines (RAG, agents) where follow-up requests arrive within milliseconds of the previous response.
 
 ### Backpressure Control
 
@@ -179,8 +180,8 @@ Start with the defaults unless you have a specific performance issue.
 Recommended tuning:
 
 - **Human chat applications** (slow follow-ups): increase `SESSION_BOOST_TTL` to `120s` or higher so the boost persists between human typing intervals.
-- **Automated pipelines** (fast follow-ups): keep `SESSION_BOOST_TTL` at `60s` and `SESSION_BOOST_GRACE_PERIOD` at `50ms`—the defaults are tuned for this.
-- **High-throughput backends**: increase `SESSION_BOOST_INFLIGHT_PER_POD` to match your backend's concurrency capacity (e.g., vLLM's `--max-num-seqs`).
+- **Automated pipelines** (fast follow-ups): keep `SESSION_BOOST_TTL` at `60s`. Consider enabling `SESSION_BOOST_GRACE_PERIOD` (e.g., `50ms`) if your pipeline issues follow-up requests within milliseconds and you want to maximize prefix cache hits.
+- **High-throughput backends**: the default `SESSION_BOOST_INFLIGHT_PER_POD=16` allows reasonable concurrency. Tune this to match your backend's actual concurrency capacity (e.g., vLLM's `--max-num-seqs`). Reduce for conservative admission control; increase for backends that handle high parallelism.
 - **Latency-sensitive workloads**: reduce `SESSION_BOOST_POLL_INTERVAL` to `50ms` for faster reaction to backend capacity changes.
 
 ## Verify Session Boost
@@ -230,7 +231,7 @@ Session boost only controls queue ordering. If the boosted request is routed to 
 
 ### Grace period causes slight latency for non-boosted requests
 
-If most of your traffic is single-turn and the grace period adds unwanted delay, set `SESSION_BOOST_GRACE_PERIOD=0` to disable it.
+The grace period is disabled by default. If you have explicitly enabled it and it adds unwanted delay for single-turn traffic, set `SESSION_BOOST_GRACE_PERIOD=0` to disable it.
 
 ### High memory usage from session tracking
 

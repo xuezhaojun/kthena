@@ -161,14 +161,14 @@ Timeline:
 
 #### Configuration
 
-| Environment Variable             | Default            | Description                                        |
-| -------------------------------- | ------------------ | -------------------------------------------------- |
-| `ENABLE_SESSION_BOOST`           | `false`            | Enable session boost queue                         |
-| `SESSION_BOOST_HEADER`           | `X-Correlation-ID` | HTTP header used to identify conversation sessions |
-| `SESSION_BOOST_TTL`              | `60s`              | Duration after which a session boost expires       |
-| `SESSION_BOOST_GRACE_PERIOD`     | `50ms`             | Wait time after release for same-session follow-up |
-| `SESSION_BOOST_POLL_INTERVAL`    | `100ms`            | Backend capacity polling interval                  |
-| `SESSION_BOOST_INFLIGHT_PER_POD` | `1`                | Max inflight requests per backend pod              |
+| Environment Variable             | Default            | Description                                                                                                                    |
+| -------------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
+| `ENABLE_SESSION_BOOST`           | `false`            | Enable session boost queue                                                                                                     |
+| `SESSION_BOOST_HEADER`           | `X-Correlation-ID` | HTTP header used to identify conversation sessions                                                                             |
+| `SESSION_BOOST_TTL`              | `60s`              | Duration after which a session boost expires                                                                                   |
+| `SESSION_BOOST_GRACE_PERIOD`     | `0`                | Wait time after release for same-session follow-up. Disabled by default; enable only when you understand the latency trade-off |
+| `SESSION_BOOST_POLL_INTERVAL`    | `100ms`            | Backend capacity polling interval                                                                                              |
+| `SESSION_BOOST_INFLIGHT_PER_POD` | `16`               | Max inflight requests per backend pod. Tune based on your backend's concurrency capacity                                       |
 
 ### Design Details
 
@@ -179,9 +179,9 @@ Timeline:
 type SessionBoostQueueConfig struct {
     SessionIDHeader          string         // HTTP header for session identification (default: "X-Correlation-ID")
     SessionBoostTTL          time.Duration  // How long a session boost is valid
-    SessionBoostGracePeriod  time.Duration  // Wait for same-session follow-up
+    SessionBoostGracePeriod  time.Duration  // Wait for same-session follow-up (default: 0, disabled)
     BackpressurePollInterval time.Duration  // Backend polling frequency
-    InflightPerPod           int            // Max concurrent requests per pod
+    InflightPerPod           int            // Max concurrent requests per pod (default: 16)
 }
 
 // SessionBoostQueue
@@ -246,7 +246,7 @@ Without session boost, Turn 2 may be queued behind 10 other requests. By the tim
 
 #### 2. Grace Period for Natural Conversation Flow
 
-Human users typically take 1-50ms between receiving a response and submitting the next message (for automated pipelines) or the follow-up may arrive within seconds (for human users). The grace period (default 50ms) holds the dequeue slot briefly for automated multi-turn pipelines (like RAG chains or agentic workflows) that issue follow-up requests programmatically.
+Human users typically take 1-50ms between receiving a response and submitting the next message (for automated pipelines) or the follow-up may arrive within seconds (for human users). The grace period is disabled by default (`0`) to avoid adding latency to non-boosted requests. When explicitly enabled (e.g., `50ms`), it holds the dequeue slot briefly for automated multi-turn pipelines (like RAG chains or agentic workflows) that issue follow-up requests programmatically. Only enable it if you understand the trade-off.
 
 #### 3. No User ID Requirement
 

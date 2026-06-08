@@ -135,9 +135,9 @@ func DefaultSessionBoostQueueConfig() SessionBoostQueueConfig {
 	return SessionBoostQueueConfig{
 		SessionIDHeader:          "", // Must be set via SESSION_BOOST_HEADER env var
 		SessionBoostTTL:          60 * time.Second,
-		SessionBoostGracePeriod:  50 * time.Millisecond,
+		SessionBoostGracePeriod:  0,
 		BackpressurePollInterval: 100 * time.Millisecond,
-		InflightPerPod:           1,
+		InflightPerPod:           16,
 	}
 }
 

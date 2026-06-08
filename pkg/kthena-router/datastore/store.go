@@ -64,7 +64,7 @@ var (
 
 const (
 	// defaultMetricsScrapeInterval is the default polling interval for pod metrics.
-	defaultMetricsScrapeInterval = 50 * time.Millisecond
+	defaultMetricsScrapeInterval = 1 * time.Second
 	metricsScrapeIntervalEnv     = "METRICS_SCRAPE_INTERVAL"
 
 	// onFlightSyncInterval caps Redis read traffic from SyncOnFlightCounts.
@@ -658,10 +658,10 @@ func (s *store) Enqueue(req *Request) error {
 }
 
 // makeBackendWaitingChecker returns a BackendWaitingChecker function that checks
-// whether any backend pod has an empty vLLM waiting queue (RequestWaitingNum == 0).
-// Returns true when at least one pod has capacity, allowing the fairness queue
-// to dequeue a request.
-func (s *store) makeBackendWaitingChecker() BackendWaitingChecker {
+// whether any backend pod serving the given model has an empty waiting queue
+// (RequestWaitingNum == 0). Returns true when at least one such pod has capacity,
+// allowing the session boost queue to dequeue a request.
+func (s *store) makeBackendWaitingChecker(modelName string) BackendWaitingChecker {
 	return func() bool {
 		hasCapacity := false
 		podCount := 0
@@ -669,6 +669,9 @@ func (s *store) makeBackendWaitingChecker() BackendWaitingChecker {
 		s.pods.Range(func(key, value any) bool {
 			podInfo, ok := value.(*PodInfo)
 			if !ok || podInfo == nil {
+				return true
+			}
+			if !podInfo.Contains(modelName) {
 				return true
 			}
 			podCount++
@@ -684,19 +687,26 @@ func (s *store) makeBackendWaitingChecker() BackendWaitingChecker {
 			return true
 		}
 		if !hasCapacity {
-			klog.Infof("[BackendWaitingChecker] all %d pods busy, totalWaiting=%.0f", podCount, totalWaiting)
+			klog.Infof("[BackendWaitingChecker] model %s: all %d pods busy, totalWaiting=%.0f", modelName, podCount, totalWaiting)
 		}
 		return hasCapacity
 	}
 }
 
-// makePodCounter returns a function that counts the number of registered backend pods.
-// Used by the fairness queue to limit inflight requests to one per pod.
-func (s *store) makePodCounter() func() int {
+// makePodCounter returns a function that counts the number of registered backend
+// pods serving the given model. Used by the session boost queue to limit inflight
+// requests proportionally to available backends for this model.
+func (s *store) makePodCounter(modelName string) func() int {
 	return func() int {
 		count := 0
 		s.pods.Range(func(key, value any) bool {
-			count++
+			podInfo, ok := value.(*PodInfo)
+			if !ok || podInfo == nil {
+				return true
+			}
+			if podInfo.Contains(modelName) {
+				count++
+			}
 			return true
 		})
 		return count
@@ -738,9 +748,9 @@ func (s *store) EnqueueSessionBoost(req *Request) (bool, error) {
 	if ok {
 		queue, _ = val.(*SessionBoostQueue)
 	} else {
-		checker := s.makeBackendWaitingChecker()
+		checker := s.makeBackendWaitingChecker(modelName)
 		newQueue := NewSessionBoostQueue(nil, *s.sessionBoostQueueConfig, checker)
-		newQueue.SetPodCounter(s.makePodCounter())
+		newQueue.SetPodCounter(s.makePodCounter(modelName))
 		val, ok = s.sessionBoostQueue.LoadOrStore(modelName, newQueue)
 		if !ok {
 			queueCtx := s.rootCtx

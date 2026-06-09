@@ -19,7 +19,7 @@ creation-date: 2025-05-09
 This proposal redesigns the autoscaling API with two goals:
 
 1. **Merge `AutoscalingPolicyBinding` into `AutoscalingPolicy`** — today users must create two resources (policy + binding) and cross-reference them. Merging eliminates the indirection, removes split configuration across objects, and gives users a single resource that fully describes "what to scale, on what signal, and how."
-2. **Add first-class `DisaggregatedTarget`** — replace the generic `SubTarget` mechanism with a purpose-built structure for coordinated multi-role scaling, including independent per-role metrics, per-role metric sources (Pod or Prometheus), replica bounds, and role-to-role ratio constraints.
+2. **Add first-class `DisaggregatedTarget`** — replace the generic `SubTarget` mechanism with a purpose-built structure for coordinated multi-role scaling, including independent per-role metrics, per-role metric sources (Pod or Prometheus), replica bounds, and a role-to-role ratio constraint.
 
 The `AutoscalingPolicyBinding` CRD and the `SubTarget` type are removed.
 
@@ -28,7 +28,7 @@ The `AutoscalingPolicyBinding` CRD and the `SubTarget` type are removed.
 In disaggregated prefill/decode inference architectures, the prefill and decode stages have fundamentally different resource profiles:
 
 - **Prefill** is compute-bound and bursty — it processes the full prompt in one forward pass.
-- **Decode** is memory-bandwidth-bound and long-running — it generates tokens autoregressively.
+- **Decode** is memory-bandwidth-bound and long-running — it generates tokens auto-regressively.
 
 Scaling these two stages independently is essential for cost-efficient serving. However, independent scaling alone is insufficient — the P/D ratio must be coordinated. Too many prefill replicas starve decode capacity (growing queues); too many decode replicas waste GPU memory on idle KV caches. A healthy system keeps the ratio within an operator-defined range.
 
@@ -49,7 +49,7 @@ Scaling these two stages independently is essential for cost-efficient serving. 
 - Merge `AutoscalingPolicyBinding` into `AutoscalingPolicy` to provide a single-resource UX.
 - Provide a single `AutoscalingPolicy` resource that drives coordinated P/D scaling for one ModelServing.
 - Allow independent `minReplicas` / `maxReplicas` per role to set per-stage capacity boundaries.
-- Introduce `ratioConstraints` so the controller can enforce healthy role-to-role ratios.
+- Introduce a `ratioConstraint` so the controller can enforce a healthy role-to-role ratio.
 - Support per-role metrics and per-role metric sources, reusing current `MetricSource` semantics (`Pod` and `Prometheus`).
 - Remove the `AutoscalingPolicyBinding` CRD and the generic `SubTarget` type.
 
@@ -85,7 +85,7 @@ As an existing user with an `AutoscalingPolicy` and one or more `AutoscalingPoli
 | Breaking change: removes `AutoscalingPolicyBinding` CRD | Both CRDs are alpha-level. Provide a migration guide and conversion tooling. The merged API is strictly simpler. |
 | Breaking change for users currently using `SubTarget` | `SubTarget` was alpha-level and only used for P/D roles — the replacement `DisaggregatedTarget` is strictly more capable. |
 | Loss of policy reuse across bindings | In practice policies are rarely shared. If reuse is needed, users can use templating tools (Helm, Kustomize). The UX win of a single resource outweighs the theoretical reuse loss. |
-| Ratio enforcement may conflict with per-role min/max bounds | Webhook validates that each `ratioConstraints` entry is achievable given min/max replica bounds at admission time. |
+| Ratio constraint may be unsatisfiable given per-role min/max bounds | The webhook validates `minRatio <= maxRatio`, that both roles exist and differ, and that the range is achievable within the role replica bounds at admission. See [Validation Rules](#validation-rules-crd--webhook). |
 | Increased controller complexity | Ratio enforcement is a bounded constraint-satisfaction problem; design details are deferred to the controller proposal. |
 
 ### Design Details
@@ -96,16 +96,16 @@ As an existing user with an `AutoscalingPolicy` and one or more `AutoscalingPoli
 |--------|-------------|
 | Delete `AutoscalingPolicyBinding` CRD | All target/binding fields move into `AutoscalingPolicy`. |
 | Delete `SubTarget` type | Replaced by `DisaggregatedTarget`. |
-| Expand `AutoscalingPolicySpec` | Add target fields (`homogeneousTarget`, `heterogeneousTarget`, `disaggregatedTarget`) directly. Metrics become the default; per-role metrics can override them. |
+| Expand `AutoscalingPolicySpec` | Add target fields (`homogeneousTarget`, `heterogeneousTarget`, `disaggregatedTarget`) directly. `spec.metrics` (uniform, applies to all roles) and per-role `metrics` are mutually exclusive. |
 | Preserve `MetricSource` model | Keep current `MetricSource` discriminated union (`Pod` / `Prometheus`) and move per-target/per-role `metricSources` into `AutoscalingPolicy`. |
-| Add `DisaggregatedTarget` | New first-class multi-role scaling type with `roles` and `ratioConstraints`. |
+| Add `DisaggregatedTarget` | New first-class multi-role scaling type with `roles` and a single `ratioConstraint`. |
 | Simplify `Target` | Remove `SubTarget` field. |
 
 ##### 1. Merged `AutoscalingPolicy`
 
 ```go
 // AutoscalingPolicySpec defines the desired state of AutoscalingPolicy.
-// +kubebuilder:validation:XValidation:rule="[has(self.heterogeneousTarget), has(self.homogeneousTarget), has(self.disaggregatedTarget)].exists_one(x, x).size() == 1",message="Exactly one of heterogeneousTarget, homogeneousTarget, or disaggregatedTarget must be set."
+// +kubebuilder:validation:XValidation:rule="(has(self.heterogeneousTarget) ? 1 : 0) + (has(self.homogeneousTarget) ? 1 : 0) + (has(self.disaggregatedTarget) ? 1 : 0) == 1",message="Exactly one of heterogeneousTarget, homogeneousTarget, or disaggregatedTarget must be set."
 type AutoscalingPolicySpec struct {
     // ...
 
@@ -146,13 +146,12 @@ type Target struct {
 }
 ```
 
-`Target` remains in use by `HomogeneousTarget` (whole-ModelServing scaling) and `HeterogeneousTarget` (multi-ModelServing optimization). Both operate at the ModelServing level and never used `SubTarget` meaningfully.
+`Target` remains in use by `HomogeneousTarget` (whole-ModelServing scaling) and `HeterogeneousTarget` (multi-ModelServing optimization). Both operate at the ModelServing level; `SubTarget` was primarily used for role-level scaling (e.g., P/D), which is superseded by `DisaggregatedTarget` in this proposal.
 
 ##### 2.1 Preserve `MetricSource` and Prometheus semantics
 
 The merged API keeps the existing metric-source model from `AutoscalingPolicyBinding` unchanged:
 
-- `MetricSource.type: Pod | Prometheus` (default `Pod`)
 - `MetricSource.pod` for direct pod scraping (`name`/`uri`/`port`/`labelSelector`)
 - `MetricSource.prometheus` for external Prometheus query (`serverURL` + `query`)
 
@@ -173,13 +172,13 @@ type DisaggregatedTarget struct {
     // +kubebuilder:validation:MinProperties=2
     Roles map[string]RoleScalingParam `json:"roles"`
 
-    // RatioConstraints defines acceptable ratio ranges between role pairs.
-    // Each constraint enforces:
+    // RatioConstraint defines the acceptable ratio range of a single role pair.
+    // It enforces:
     //   minRatio <= replicas[numeratorRole] / replicas[denominatorRole] <= maxRatio
-    // when denominator replicas is non-zero.
+    // when denominator replica is non-zero.
     //
     // +optional
-    RatioConstraints []RoleRatioConstraint `json:"ratioConstraints,omitempty"`
+    RatioConstraint *RoleRatioConstraint `json:"ratioConstraint,omitempty"`
 }
 
 // RoleScalingParam defines the scaling configuration for one role.
@@ -194,9 +193,13 @@ type RoleScalingParam struct {
     // +kubebuilder:validation:Maximum=1000000
     MaxReplicas int32 `json:"maxReplicas"`
 
-    // Metrics overrides the policy-level metrics for this specific role.
-    // This allows different roles to scale on different signals.
-    // If not set, the top-level spec.metrics are used.
+    // Metrics defines the list of metrics used to evaluate scaling decisions
+    // for this role, allowing different roles to scale on different signals.
+    //
+    // spec.metrics (policy-level) and per-role metrics are MUTUALLY EXCLUSIVE:
+    // either set spec.metrics to scale every role on the same signals, or set
+    // metrics on every role here and leave spec.metrics empty. They must not
+    // both be set (see Validation Rules).
     // +optional
     // +kubebuilder:validation:MinItems=1
     Metrics []AutoscalingPolicyMetric `json:"metrics,omitempty"`
@@ -204,13 +207,14 @@ type RoleScalingParam struct {
     // MetricSources declares how each metric is fetched for this role.
     // Keys must match role-level metrics when present, otherwise top-level
     // spec.metrics[].name.
-    // Missing keys default to pod scraping behavior equivalent to an empty
-    // PodMetricSource (uri=/metrics, port=8100, metric name defaults to key).
+    // Missing keys are treated as missing metrics for that reconcile loop.
     // +optional
     MetricSources map[string]MetricSource `json:"metricSources,omitempty"`
 }
 
 // RoleRatioConstraint defines the acceptable ratio range between two roles.
+// +kubebuilder:validation:XValidation:rule="self.minRatio <= self.maxRatio",message="minRatio must be <= maxRatio"
+// +kubebuilder:validation:XValidation:rule="self.numeratorRole != self.denominatorRole",message="numeratorRole and denominatorRole must differ"
 type RoleRatioConstraint struct {
     // NumeratorRole is the role on the numerator side of the ratio.
     NumeratorRole string `json:"numeratorRole"`
@@ -269,7 +273,7 @@ type AutoscalingPolicyStatus struct {
     // Well-known condition types include:
     //   - "Ready":                   the policy is actively reconciled.
     //   - "TargetFound":             the referenced ModelServing (and roles) exist.
-    //   - "RatioConstraintViolated": the desired counts could not satisfy ratioConstraints
+    //   - "RatioConstraintViolated": the desired counts could not satisfy ratioConstraint
     //                                given the per-role min/max bounds.
     // +optional
     // +listType=map
@@ -314,25 +318,42 @@ type TargetScalingStatus struct {
 }
 
 // DisaggregatedScalingStatus reports the observed state of a DisaggregatedTarget.
+//
+// Example: a prefill/decode target whose metrics asked for prefill=6, decode=2,
+// but the ratioConstraint prefill/decode <= 1 forced decode up to 6:
+//
+//   disaggregatedStatus:
+//     roles:
+//       - name: prefill
+//         currentReplicas: 6
+//         desiredReplicas: 6        # metric-derived, kept as-is
+//       - name: decode
+//         currentReplicas: 6
+//         desiredReplicas: 2        # metric asked for 2, ratio raised it to 6
+//     ratioStatus:
+//       numeratorRole: prefill
+//       denominatorRole: decode
+//       currentRatio: "1"         # 6/6, within [0.25, 1]
+//     ratioAdjusted: true           # decode was overridden to satisfy the ratio
 type DisaggregatedScalingStatus struct {
     // Roles reports the observed scaling state per role.
     Roles []TargetScalingStatus `json:"roles"`
 
-    // RatioStatuses reports the observed value per configured ratio constraint.
+    // RatioStatus reports the observed value of the configured ratio constraint.
     // +optional
-    RatioStatuses []RoleRatioStatus `json:"ratioStatuses,omitempty"`
+    RatioStatus *RoleRatioStatus `json:"ratioStatus,omitempty"`
 
     // RatioAdjusted is true when the most recent reconcile had to override the
-    // metric-derived replica counts to satisfy one or more ratio constraints.
+    // metric-derived replica counts to satisfy the ratio constraint.
     // +optional
     RatioAdjusted bool `json:"ratioAdjusted,omitempty"`
 }
 
-// RoleRatioStatus reports the observed value for one ratio constraint.
+// RoleRatioStatus reports the observed value for the ratio constraint.
 type RoleRatioStatus struct {
-  NumeratorRole   string `json:"numeratorRole"`
-  DenominatorRole string `json:"denominatorRole"`
-  CurrentRatio    string `json:"currentRatio,omitempty"`
+    NumeratorRole   string `json:"numeratorRole"`
+    DenominatorRole string `json:"denominatorRole"`
+    CurrentRatio    string `json:"currentRatio,omitempty"`
 }
 ```
 
@@ -341,7 +362,7 @@ Recommended printer columns for `kubectl get autoscalingpolicy`:
 | Column | Source |
 |--------|--------|
 | `ROLES` | `len(status.disaggregatedStatus.roles)` |
-| `RATIOS` | `len(status.disaggregatedStatus.ratioStatuses)` |
+| `RATIO` | `status.disaggregatedStatus.ratioStatus.currentRatio` |
 | `READY` | `status.conditions[type=Ready].status` |
 
 #### Full YAML Examples
@@ -356,10 +377,8 @@ metadata:
   namespace: default
 spec:
   tolerancePercent: 10
-  # Default metrics — used as fallback when a role doesn't specify its own
-  metrics:
-    - name: pending_requests
-      targetValue: "5"
+  # Each role defines its own metrics below, so policy-level spec.metrics is omitted
+  # (spec.metrics and per-role metrics are mutually exclusive).
   behavior:
     scaleUp:
       stablePolicy:
@@ -383,14 +402,14 @@ spec:
       prefill:
         minReplicas: 1
         maxReplicas: 8
-        metrics:                           # override default metrics for prefill
+        metrics:                           # this role's own metrics (no spec.metrics fallback)
           - name: num_requests_waiting
             targetValue: "5"
         metricSources:
           num_requests_waiting:
             type: Pod
             pod:
-              name: num_requests_waiting
+              name: deepseek-prefill
               uri: /metrics
               port: 8100
               labelSelector:
@@ -399,7 +418,7 @@ spec:
       decode:
         minReplicas: 2
         maxReplicas: 16
-        metrics:                           # override default metrics for decode
+        metrics:                           # this role's own metrics (no spec.metrics fallback)
           - name: gpu_kv_cache_usage_percent
             targetValue: "80"
         metricSources:
@@ -408,11 +427,11 @@ spec:
             prometheus:
               serverURL: http://kube-prometheus-stack-prometheus.monitoring.svc:9090
               query: avg(vllm_gpu_kv_cache_usage_percent{role="decode",model="llm-vllm-disagg"})
-    ratioConstraints:
-      - numeratorRole: prefill
-        denominatorRole: decode
-        minRatio: "0.25"                  # P:D >= 1:4
-        maxRatio: "1"                     # P:D <= 1:1
+    ratioConstraint:
+      numeratorRole: prefill
+      denominatorRole: decode
+      minRatio: "0.25"                  # P:D >= 1:4
+      maxRatio: "1"                     # P:D <= 1:1
 ```
 
 ##### Homogeneous scaling (single resource, before vs. after)
@@ -427,7 +446,7 @@ metadata:
 spec:
   tolerancePercent: 10
   metrics:
-    - name: pending_requests
+    - name: num_requests_waiting
       targetValue: "5"
   behavior: { ... }
 ---
@@ -457,7 +476,7 @@ metadata:
 spec:
   tolerancePercent: 10
   metrics:
-    - name: pending_requests
+    - name: num_requests_waiting
       targetValue: "5"
   behavior: { ... }
   homogeneousTarget:
@@ -469,248 +488,47 @@ spec:
     maxReplicas: 10
 ```
 
-#### Validation Rules (Webhook)
+#### Validation Rules (CRD + Webhook)
 
 | Rule | Scope |
 |------|-------|
 | Exactly one of `homogeneousTarget`, `heterogeneousTarget`, `disaggregatedTarget` must be set. | `AutoscalingPolicySpec` (CEL) |
-| `spec.metrics` must have at least one entry. | `AutoscalingPolicySpec` |
+| `spec.metrics` and per-role `metrics` are mutually exclusive: set `spec.metrics` (uniform) **or** set `metrics` on every role, never both. | `AutoscalingPolicySpec` / `DisaggregatedTarget` (webhook) |
+| Whichever metrics list is used (`spec.metrics` or each role's `metrics`) must have at least one entry. | `AutoscalingPolicySpec` / `RoleScalingParam` |
 | `metricSources` keys must be a subset of the effective metric names for that scope. | `Target` / `RoleScalingParam` |
 | For each `MetricSource`, `type`/backend pairing must be valid (`Pod` -> `pod`, `Prometheus` -> `prometheus`). | `MetricSource` (CEL, preserved) |
 | `targetRef.kind` must be `ModelServing`. | `DisaggregatedTarget` |
 | `roles` map keys must reference existing roles in the referenced ModelServing and contain at least two entries. | `DisaggregatedTarget` |
 | `minReplicas <= maxReplicas` for each role. | `RoleScalingParam` |
-| For each `ratioConstraints` item: `numeratorRole != denominatorRole`, both roles exist in `roles`, and `minRatio <= maxRatio`. | `RoleRatioConstraint` (CEL) |
-| No two `ratioConstraints` items may share the same `(numeratorRole, denominatorRole)` pair. | `DisaggregatedTarget` (CEL) |
-| For each inverse pair `(A→B, B→A)`, the ranges must overlap: `[minRatio, maxRatio]` of `B→A` must intersect `[1/maxRatio, 1/minRatio]` of `A→B`. | `DisaggregatedTarget` (webhook) |
-| For every cycle in the constraint graph, the product of `minRatio` values ≤ 1 and the product of `maxRatio` values ≥ 1. | `DisaggregatedTarget` (webhook) |
-| For each transitive path `A→…→C`, if an explicit `A→C` constraint exists, the implied range (product of edge ranges) must overlap with the explicit range. | `DisaggregatedTarget` (webhook) |
-| For each `ratioConstraints` item, bounds must be jointly achievable given role min/max replicas (when denominator min > 0). | `DisaggregatedTarget` |
-| For every constrained role pair `(A,B)`, scalable-to-zero must match: `roles[A].minReplicas == 0` **iff** `roles[B].minReplicas == 0`. | `DisaggregatedTarget` (CEL) |
+| If `ratioConstraint` is set: `numeratorRole != denominatorRole`, both roles exist in `roles`, and `minRatio <= maxRatio`. | `RoleRatioConstraint` (CEL) |
+| If `ratioConstraint` is set, bounds must be achievable given role min/max replicas: `numerator.minReplicas / denominator.maxReplicas <= maxRatio` **and** `numerator.maxReplicas / denominator.minReplicas >= minRatio` (when `denominator.minReplicas > 0`). | `DisaggregatedTarget` |
+| If `ratioConstraint` is set, the two referenced roles must be scalable-to-zero together: `roles[numeratorRole].minReplicas == 0` **iff** `roles[denominatorRole].minReplicas == 0`. | `DisaggregatedTarget` (CEL) |
+| `minRatio` / `maxRatio` must not carry a unit suffix (e.g., reject `"250m"`). | `RoleRatioConstraint` |
 
 #### Scaling Semantics (Controller Contract)
 
 > **Note**: Controller implementation is out of scope for this proposal. These semantics define the contract the controller must honor.
 
-1. **Independent metric evaluation**: The controller evaluates metrics independently for each role in `disaggregatedTarget.roles`, producing a desired replica count per role. If a role defines its own `metrics`, those are used; otherwise the controller falls back to the top-level `spec.metrics`.
-2. **Metric source resolution**: For each effective metric name, the controller resolves `MetricSource` in this order: role-level `metricSources`, then target-level/default semantics. Resolved sources can be pod scraping or Prometheus query.
-3. **Per-role clamping**: Each desired count is clamped to `[minReplicas, maxReplicas]` of the corresponding role.
-4. **Coupled scale-to-zero (per constrained pair)**: For each pair appearing in `ratioConstraints`, both roles in that pair must reach zero together. The controller does not evaluate that pair's ratio while either side is `0`.
-5. **Ratio enforcement**: For each configured role pair, when both roles are non-zero, after clamping the controller adjusts replica counts to satisfy `minRatio <= replicas[numeratorRole]/replicas[denominatorRole] <= maxRatio`.
-6. **Atomic patch**: The controller patches all affected `spec.template.roles[*].replicas` in a single ModelServing update to avoid transient states that violate ratio constraints.
+1. **Effective metrics per role**: `spec.metrics` and per-role `metrics` are mutually exclusive. When `spec.metrics` is set, every role is evaluated against that shared list; when per-role `metrics` are set, each role is evaluated against its own list. The controller computes a desired replica count for each role independently.
+2. **Multiple metrics combine by max**: When a role's effective list contains more than one metric, the controller computes a desired count for each metric independently and takes the **maximum** (the standard HPA rule), so the most demanding signal wins. For example, if `pending_requests` implies 1 replica but `num_requests_waiting` implies 10, the role scales to 10. This removes any ambiguity when two metrics disagree.
+3. **Metric source resolution**: For each effective metric name, the controller resolves `MetricSource` in this order: role-level `metricSources`, then target-level/default semantics. Resolved sources can be pod scraping or Prometheus query.
+4. **Per-role clamping**: Each desired count is clamped to `[minReplicas, maxReplicas]` of the corresponding role.
+5. **Coupled scale-to-zero**: When `ratioConstraint` is set, the two roles it references must reach zero together. The controller does not evaluate the ratio while either side is `0`.
+6. **Ratio enforcement**: For the configured role pair, when both roles are non-zero, after clamping the controller adjusts replica counts to satisfy `minRatio <= replicas[numeratorRole]/replicas[denominatorRole] <= maxRatio` (see [Ratio Enforcement Algorithm](#ratio-enforcement-algorithm)).
+7. **Atomic patch**: The controller patches both affected `spec.template.roles[*].replicas` in a single ModelServing update to avoid transient states that violate the ratio constraint.
 
-#### Multi-Constraint Conflict Analysis
+#### Ratio Enforcement Algorithm
 
-When `ratioConstraints` contains multiple entries, the constraints may be mutually unsatisfiable. This section enumerates all known conflict categories and specifies how the system must detect or handle each one.
+The webhook rejects an infeasible `ratioConstraint` at admission (see [Validation Rules](#validation-rules-crd--webhook)), so the controller always starts from a constraint whose feasible region is **non-empty**. Enforcement therefore reduces to *projecting* the two metric-derived replica counts into that region — never a search that might fail:
 
-##### Conflict Taxonomy
+1. **Start from clamped desire**: take `desired[numeratorRole]` and `desired[denominatorRole]`, each already clamped to its own `[minReplicas, maxReplicas]`.
+2. **Skip when either side is zero**: if either role resolved to `0`, the ratio is not evaluated (see coupled scale-to-zero above).
+3. **Scale-up–biased repair**: if the pair violates the range, fix it by *increasing* the deficient role rather than shrinking the other, so capacity is never reduced below what metrics asked for:
+   - if `num/den < minRatio`: raise `num` to `ceil(minRatio · den)`; if that exceeds `maxReplicas(num)`, instead lower `den` to `floor(num / minRatio)`.
+   - if `num/den > maxRatio`: raise `den` to `ceil(num / maxRatio)`; if that exceeds `maxReplicas(den)`, instead lower `num` to `floor(maxRatio · den)`.
+4. **Report**: set `status.disaggregatedStatus.ratioAdjusted = true` when the repair changed any metric-derived count, and record the resulting ratio in `status.disaggregatedStatus.ratioStatus`.
 
-###### Type 1: Cyclic Inconsistency
-
-When constraints form a directed cycle — for example three constraints `A→B`, `B→C`, `C→A` — the product of ratios around the cycle is a mathematical identity:
-
-$$\frac{r_A}{r_B} \times \frac{r_B}{r_C} \times \frac{r_C}{r_A} = 1$$
-
-For the cycle to be satisfiable, the product of the constraint ranges must contain `1`:
-
-- product of all `minRatio` values along the cycle ≤ 1
-- product of all `maxRatio` values along the cycle ≥ 1
-
-**Example (infeasible)**:
-
-```yaml
-ratioConstraints:
-  - numeratorRole: A
-    denominatorRole: B
-    minRatio: "0.5"          # A/B = 0.5
-    maxRatio: "0.5"
-  - numeratorRole: B
-    denominatorRole: C
-    minRatio: "0.5"          # B/C = 0.5
-    maxRatio: "0.5"
-  - numeratorRole: C
-    denominatorRole: A
-    minRatio: "0.5"          # C/A = 0.5
-    maxRatio: "0.5"
-```
-
-Product of `minRatio`: `0.5 × 0.5 × 0.5 = 0.125 < 1` ✓, but product of `maxRatio`: `0.5 × 0.5 × 0.5 = 0.125 < 1` ✗. The range `[0.125, 0.125]` does not contain `1`, so no solution exists.
-
-A consistent version would be:
-
-```yaml
-ratioConstraints:
-  - numeratorRole: A
-    denominatorRole: B
-    minRatio: "0.5"
-    maxRatio: "1"
-  - numeratorRole: B
-    denominatorRole: C
-    minRatio: "0.5"
-    maxRatio: "1"
-  - numeratorRole: C
-    denominatorRole: A
-    minRatio: "1"
-    maxRatio: "4"
-# min product = 0.5 × 0.5 × 1 = 0.25 ≤ 1  ✓
-# max product = 1 × 1 × 4 = 4 ≥ 1  ✓
-```
-
-This generalizes to any cycle length: for a cycle of `k` edges, the product condition must hold.
-
-###### Type 2: Transitive Inconsistency
-
-Two constraints `A→B` and `B→C` imply a derived range for `A→C`:
-
-$$m_{AB} \times m_{BC} \leq \frac{r_A}{r_C} \leq M_{AB} \times M_{BC}$$
-
-If the user also provides an explicit `A→C` constraint, the explicit range must overlap with the implied range. Otherwise the constraints are unsatisfiable.
-
-**Example (infeasible)**:
-
-```yaml
-ratioConstraints:
-  - numeratorRole: A
-    denominatorRole: B
-    minRatio: "2"
-    maxRatio: "3"    # A/B ∈ [2,3]
-  - numeratorRole: B
-    denominatorRole: C
-    minRatio: "2"
-    maxRatio: "3"    # B/C ∈ [2,3]
-  # Implied: A/C ∈ [4, 9]
-  - numeratorRole: A
-    denominatorRole: C
-    minRatio: "1"
-    maxRatio: "2"   # A/C ∈ [1,2] — no overlap with [4,9]
-```
-
-###### Type 3: Inverse Pair Inconsistency
-
-If both `A→B` and `B→A` constraints exist, they must be inverses. Constraint `A→B ∈ [m₁, M₁]` implies `B→A ∈ [1/M₁, 1/m₁]`. The explicit `B→A ∈ [m₂, M₂]` must overlap:
-
-$$\max(m_2,\ 1/M_1) \leq \min(M_2,\ 1/m_1)$$
-
-**Example (infeasible)**:
-
-```yaml
-ratioConstraints:
-  - numeratorRole: A
-    denominatorRole: B
-    minRatio: "2"
-    maxRatio: "3"    # A/B ∈ [2,3] → B/A ∈ [0.33,0.5]
-  - numeratorRole: B
-    denominatorRole: A
-    minRatio: "1"
-    maxRatio: "2"    # B/A ∈ [1,2] — no overlap with [0.33,0.5]
-```
-
-###### Type 4: Duplicate Pair Conflict
-
-Two constraints that reference the same ordered pair `(A, B)` with non-overlapping ranges.
-
-**Example (infeasible)**:
-
-```yaml
-ratioConstraints:
-  - numeratorRole: A
-    denominatorRole: B
-    minRatio: "1"
-    maxRatio: "2"
-  - numeratorRole: A
-    denominatorRole: B
-    minRatio: "4"
-    maxRatio: "5"
-```
-
-###### Type 5: Replica Bound–Ratio Conflict
-
-Even if ratio constraints are mathematically consistent with each other, they may be unsatisfiable given the integer `minReplicas`/`maxReplicas` bounds of each role.
-
-**Example (infeasible)**:
-
-```yaml
-roles:
-  A:
-    minReplicas: 1
-    maxReplicas: 2
-  B:
-    minReplicas: 1
-    maxReplicas: 2
-ratioConstraints:
-  - numeratorRole: A
-    denominatorRole: B
-    minRatio: "3"
-    maxRatio: "4"
-# A/B ≥ 3 requires A ≥ 3·B ≥ 3, but maxReplicas(A) = 2.
-```
-
-###### Type 6: Integer Feasibility Gap
-
-A constraint range that is satisfiable in continuous values but has no integer solution within the replica bounds.
-
-**Example (infeasible in integers)**:
-
-```yaml
-roles:
-  A:
-    minReplicas: 1
-    maxReplicas: 1
-  B:
-    minReplicas: 3
-    maxReplicas: 3
-ratioConstraints:
-  - { numeratorRole: A, denominatorRole: B, minRatio: "0.4", maxRatio: "0.45" }
-# A/B = 1/3 ≈ 0.333, outside [0.4, 0.45]. No other integer combination is possible.
-```
-
-##### Detection Strategy
-
-Conflicts are detected at **two stages**:
-
-| Stage | Checks | Mechanism |
-|-------|--------|-----------|
-| **Admission (webhook)** | Type 1 (cycle product), Type 2 (transitive overlap), Type 3 (inverse pair), Type 4 (duplicate pair), Type 5 (bound–ratio) | Webhook validates on create/update. Build a directed constraint graph, enumerate all simple cycles (bounded by role count), verify product conditions, compute transitive closures, cross-check with replica bounds. |
-| **Runtime (controller)** | Type 6 (integer feasibility), edge cases missed by continuous analysis | Controller reports `RatioConstraintViolated` condition when no integer assignment satisfies all constraints simultaneously. |
-
-Admission-time validation algorithm sketch:
-
-1. **Build constraint graph**: Nodes = role names, directed edge for each `RoleRatioConstraint` labeled with `[minRatio, maxRatio]`.
-2. **Reject duplicate pairs** (Type 4): Error if two edges share the same `(numeratorRole, denominatorRole)`.
-3. **Merge inverse pairs** (Type 3): For each edge `A→B [m, M]`, if edge `B→A [m', M']` also exists, verify `[m', M'] ∩ [1/M, 1/m] ≠ ∅`.
-4. **Cycle detection** (Type 1): Find all simple cycles using DFS. For each cycle, multiply the `minRatio` values and `maxRatio` values along the cycle. Reject if the product range does not contain `1`.
-5. **Transitive closure** (Type 2): For each pair `(A, C)` reachable via a path `A→…→C`, compute the implied range by multiplying edge ranges along the path. If an explicit `A→C` edge exists, verify overlap.
-6. **Bound feasibility** (Type 5): For each edge `A→B [m, M]`, verify: `m ≤ maxReplicas(A)/minReplicas(B)` and `M ≥ minReplicas(A)/maxReplicas(B)` (when denominators > 0).
-
-> **Complexity**: With `N` roles, the number of simple cycles is at most exponential in `N`, but in practice `N` is small (typically 2–4 roles). For `N ≤ 10`, exhaustive cycle enumeration is computationally trivial.
-
-##### Resolution Strategies
-
-When the controller encounters conflicts at runtime (Type 6 or transient inconsistencies during scaling), it must choose a resolution strategy. Three candidates are considered:
-
-**Priority-based relaxation**
-
-Each `RoleRatioConstraint` carries an optional `priority` field (higher value = higher priority, default = 0). When constraints cannot all be satisfied simultaneously, the controller drops the lowest-priority constraints first until a feasible solution exists.
-
-```go
-type RoleRatioConstraint struct {
-    NumeratorRole   string            `json:"numeratorRole"`
-    DenominatorRole string            `json:"denominatorRole"`
-    MinRatio        resource.Quantity `json:"minRatio"`
-    MaxRatio        resource.Quantity `json:"maxRatio"`
-    // Priority determines enforcement order when constraints conflict at
-    // runtime. Higher values are enforced first. Default is 0.
-    // +optional
-    // +kubebuilder:default=0
-    Priority int32 `json:"priority,omitempty"`
-}
-```
-
-**Recommendation**: Use priority-based for runtime resolution, combined with fail-closed for admission-time detected conflicts. This ensures:
-
-- Statically detectable conflicts (Types 1–5) are rejected at admission — the user must fix the spec.
-- Runtime-only conflicts (Type 6, transient states) are handled gracefully via priority relaxation.
-- The controller always reports which constraints were relaxed in `status.disaggregatedStatus.ratioStatuses`.
+Because the admission webhook guarantees a non-empty integer feasible region within the role replica bounds, the single-pair projection always succeeds in one pass. This biases the result toward the smallest replica vector that is **≥ metric demand** and satisfies the constraint, so SLOs are protected at the cost of a few extra replicas rather than risking under-provisioning.
 
 #### Migration
 
@@ -729,7 +547,7 @@ type RoleRatioConstraint struct {
 | Policy: metrics + behavior | `spec.metrics` + `spec.behavior` (same policy) |
 | Binding A: `homogeneousTarget.target.subTargets: {kind: Role, name: prefill}` | `spec.disaggregatedTarget.roles.prefill` |
 | Binding B: `homogeneousTarget.target.subTargets: {kind: Role, name: decode}` | `spec.disaggregatedTarget.roles.decode` |
-| 3 resources, no ratio coordination | 1 resource, `ratioConstraints` provides coordination |
+| 3 resources, no ratio coordination | 1 resource, `ratioConstraint` provides coordination |
 
 ### Alternatives
 
@@ -751,7 +569,7 @@ Add a `volcano.sh/pd-ratio-range` annotation to coordinate two separate bindings
 type DisaggregatedTarget struct {
     TargetRef  corev1.ObjectReference `json:"targetRef"`
     Roles      []RoleScalingParam     `json:"roles"`
-    RatioConstraints []RoleRatioConstraint `json:"ratioConstraints,omitempty"`
+    RatioConstraint *RoleRatioConstraint `json:"ratioConstraint,omitempty"`
 }
 ```
 
@@ -779,7 +597,7 @@ type RoleRatio struct {
     Denominator int32 `json:"denominator"`
 }
 
-// RoleRatioConstraintIntPair defines one role-pair ratio constraint.
+// RoleRatioConstraintIntPair defines the role-pair ratio constraint.
 type RoleRatioConstraintIntPair struct {
     NumeratorRole   string    `json:"numeratorRole"`
     DenominatorRole string    `json:"denominatorRole"`
@@ -791,15 +609,15 @@ type RoleRatioConstraintIntPair struct {
 Example YAML:
 
 ```yaml
-    ratioConstraints:
-      - numeratorRole: prefill
-        denominatorRole: decode
-        minRatio:                # P:D >= 1:4
-          numerator: 1
-          denominator: 4
-        maxRatio:                # P:D <= 1:1
-          numerator: 1
-          denominator: 1
+    ratioConstraint:
+      numeratorRole: prefill
+      denominatorRole: decode
+      minRatio:                # P:D >= 1:4
+        numerator: 1
+        denominator: 4
+      maxRatio:                # P:D <= 1:1
+        numerator: 1
+        denominator: 1
 ```
 
 **Pros**:

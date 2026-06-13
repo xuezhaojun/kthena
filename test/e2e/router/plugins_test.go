@@ -110,11 +110,8 @@ func TestSchedulerPluginLeastRequest(t *testing.T) {
 func TestSchedulerPluginLeastLatency(t *testing.T) {
 	ctx := context.Background()
 
-	fastPods := utils.ListReadyPodsByLabel(t, testCtx.KubeClient, testNamespace, "app="+plugincontext.AppLabel)
+	fastPods := listReadyMockPods(t, testCtx.KubeClient, testNamespace)
 	require.Len(t, fastPods, pluginMockReplicaCount, "fast mock pool")
-
-	deploySlowLatencyMockStack(t, testCtx.KubeClient, testNamespace)
-	_ = utils.CreateModelServerFromFile(t, ctx, testCtx.KthenaClient, plugincontext.TestDataDir, testNamespace, "ModelServer-plugins-mixed.yaml")
 
 	slowPods := utils.ListReadyPodsByLabel(t, testCtx.KubeClient, testNamespace, "app="+plugincontext.SlowMockAppLabel)
 	require.Len(t, slowPods, 1, "slow mock pool")

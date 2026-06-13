@@ -17,11 +17,9 @@ limitations under the License.
 package router
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -29,9 +27,7 @@ import (
 	backendmetrics "github.com/volcano-sh/kthena/pkg/kthena-router/backend/metrics"
 	plugincontext "github.com/volcano-sh/kthena/test/e2e/router/router-plugins/context"
 	"github.com/volcano-sh/kthena/test/e2e/utils"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -43,31 +39,9 @@ const (
 
 func listReadyMockPods(t *testing.T, kube kubernetes.Interface, namespace string) []corev1.Pod {
 	t.Helper()
-	ready := utils.ListReadyPodsByLabel(t, kube, namespace, "app="+plugincontext.AppLabel)
+	ready := utils.ListReadyPodsByLabel(t, kube, namespace, "app="+plugincontext.DeploymentName)
 	require.NotEmpty(t, ready, "no ready mock pods")
 	return ready
-}
-
-// deploySlowLatencyMockStack deploys the slow mock backend for least-latency e2e.
-// Recreate so a prior run cannot leave multiple ready slow pods.
-func deploySlowLatencyMockStack(t *testing.T, kube kubernetes.Interface, namespace string) {
-	t.Helper()
-	ctx := context.Background()
-	name := plugincontext.SlowMockDeploymentName
-
-	utils.DeleteDeploymentAndWait(t, kube, namespace, name, 2*time.Minute)
-
-	deployment := utils.LoadYAMLFromFile[appsv1.Deployment](filepath.Join(plugincontext.TestDataDir, "LLM-Mock-plugins-slow.yaml"))
-	deployment.Namespace = namespace
-	_, err := kube.AppsV1().Deployments(namespace).Create(ctx, deployment, metav1.CreateOptions{})
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		_ = kube.AppsV1().Deployments(namespace).Delete(context.Background(), name, metav1.DeleteOptions{})
-	})
-	utils.WaitForDeploymentReady(t, ctx, kube, namespace, name, 1, 5*time.Minute)
-	require.Eventually(t, func() bool {
-		return len(utils.ListReadyPodsByLabel(t, kube, namespace, "app="+plugincontext.SlowMockAppLabel)) == 1
-	}, 2*time.Minute, 2*time.Second, "expected exactly one ready slow mock pod")
 }
 
 func waitForSchedulerPluginInMetrics(t *testing.T, metricsURL, pluginName, pluginType string) {

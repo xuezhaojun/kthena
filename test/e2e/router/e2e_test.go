@@ -70,12 +70,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	pluginCtx := &plugincontext.PluginTestContext{
-		KubeClient:   testCtx.KubeClient,
-		KthenaClient: testCtx.KthenaClient,
-		Namespace:    testNamespace,
-	}
-	if err := pluginCtx.SetupPluginComponents(); err != nil {
+	if err := plugincontext.SetupPluginComponents(testCtx.KubeClient, testCtx.KthenaClient, testNamespace); err != nil {
 		fmt.Printf("Failed to setup plugin components: %v\n", err)
 		_ = testCtx.CleanupCommonComponents()
 		_ = testCtx.DeleteTestNamespace()
@@ -85,10 +80,6 @@ func TestMain(m *testing.M) {
 
 	// Run tests
 	code := m.Run()
-
-	if err := pluginCtx.CleanupPluginComponents(); err != nil {
-		fmt.Printf("Failed to cleanup plugin components: %v\n", err)
-	}
 
 	// Cleanup common components
 	if err := testCtx.CleanupCommonComponents(); err != nil {

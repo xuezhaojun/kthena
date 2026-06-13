@@ -39,12 +39,21 @@ func WaitForRouterValidatingWebhook(
 ) {
 	t.Helper()
 	t.Log("Waiting for kthena-router validating webhook to accept requests")
+	err := WaitForRouterValidatingWebhookE(ctx, kthenaClient, namespace, modelServerName, modelName)
+	require.NoError(t, err, "kthena-router validating webhook did not become ready in time")
+}
 
+// WaitForRouterValidatingWebhookE is like WaitForRouterValidatingWebhook but returns an error.
+func WaitForRouterValidatingWebhookE(
+	ctx context.Context,
+	kthenaClient *clientset.Clientset,
+	namespace, modelServerName, modelName string,
+) error {
 	weight100 := uint32(100)
 	waitCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 
-	err := wait.PollUntilContextCancel(waitCtx, defaultPollingInterval, true, func(ctx context.Context) (bool, error) {
+	return wait.PollUntilContextCancel(waitCtx, defaultPollingInterval, true, func(ctx context.Context) (bool, error) {
 		probe := &networkingv1alpha1.ModelRoute{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: namespace,
@@ -65,14 +74,12 @@ func WaitForRouterValidatingWebhook(
 		_, err := kthenaClient.NetworkingV1alpha1().ModelRoutes(namespace).Create(ctx, probe, metav1.CreateOptions{DryRun: []string{"All"}})
 		if err != nil {
 			if isTransientWebhookError(err) {
-				t.Logf("Router validating webhook not ready yet, retrying: %v", err)
 				return false, nil
 			}
 			return false, err
 		}
 		return true, nil
 	})
-	require.NoError(t, err, "kthena-router validating webhook did not become ready in time")
 }
 
 func isTransientWebhookError(err error) bool {

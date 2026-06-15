@@ -259,7 +259,7 @@ func TestStoreUpdatePodMetrics(t *testing.T) {
 		pods:        sync.Map{},
 		modelServer: sync.Map{},
 		podRuntimeInspector: &fakePodRuntimeInspector{
-			metricsFn: func(_ string, _ *corev1.Pod, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+			metricsFn: func(_ string, _ *corev1.Pod, _ uint32, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
 				return map[string]float64{
 						utils.KVCacheUsage:      0.8,
 						utils.RequestWaitingNum: 15,
@@ -1533,26 +1533,26 @@ func TestStoreMatchModelServer(t *testing.T) {
 }
 
 type fakePodRuntimeInspector struct {
-	metricsFn    func(string, *corev1.Pod, map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram)
-	modelsFn     func(string, *corev1.Pod) ([]string, error)
+	metricsFn    func(string, *corev1.Pod, uint32, map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram)
+	modelsFn     func(string, *corev1.Pod, uint32) ([]string, error)
 	metricsCalls atomic.Int64
 	modelsCalls  atomic.Int64
 }
 
-func (f *fakePodRuntimeInspector) GetPodMetrics(engine string, pod *corev1.Pod, previousHistogram map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+func (f *fakePodRuntimeInspector) GetPodMetrics(engine string, pod *corev1.Pod, port uint32, previousHistogram map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
 	f.metricsCalls.Add(1)
 	if f.metricsFn == nil {
 		return nil, nil
 	}
-	return f.metricsFn(engine, pod, previousHistogram)
+	return f.metricsFn(engine, pod, port, previousHistogram)
 }
 
-func (f *fakePodRuntimeInspector) GetPodModels(engine string, pod *corev1.Pod) ([]string, error) {
+func (f *fakePodRuntimeInspector) GetPodModels(engine string, pod *corev1.Pod, port uint32) ([]string, error) {
 	f.modelsCalls.Add(1)
 	if f.modelsFn == nil {
 		return nil, nil
 	}
-	return f.modelsFn(engine, pod)
+	return f.modelsFn(engine, pod, port)
 }
 
 func newStore(inspector ...PodRuntimeInspector) *store {
@@ -1670,10 +1670,10 @@ func TestAddOrUpdatePod_MetricsPreservedOnUpdate(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			inspector := &fakePodRuntimeInspector{
-				metricsFn: func(_ string, _ *corev1.Pod, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+				metricsFn: func(_ string, _ *corev1.Pod, _ uint32, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
 					return tc.initialMetrics, tc.initialHist
 				},
-				modelsFn: func(_ string, _ *corev1.Pod) ([]string, error) {
+				modelsFn: func(_ string, _ *corev1.Pod, _ uint32) ([]string, error) {
 					return tc.initialModels, nil
 				},
 			}
@@ -1734,13 +1734,13 @@ func TestAddOrUpdatePod_MetricsPreservedOnUpdate(t *testing.T) {
 
 func TestAddOrUpdatePod_NewPodStillFetchesMetrics(t *testing.T) {
 	inspector := &fakePodRuntimeInspector{
-		metricsFn: func(_ string, _ *corev1.Pod, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+		metricsFn: func(_ string, _ *corev1.Pod, _ uint32, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
 			return map[string]float64{
 				utils.KVCacheUsage:      0.3,
 				utils.RequestRunningNum: 2,
 			}, map[string]*dto.Histogram{}
 		},
-		modelsFn: func(_ string, _ *corev1.Pod) ([]string, error) {
+		modelsFn: func(_ string, _ *corev1.Pod, _ uint32) ([]string, error) {
 			return []string{"base-model"}, nil
 		},
 	}
@@ -1763,7 +1763,7 @@ func TestAddOrUpdatePod_NewPodStillFetchesMetrics(t *testing.T) {
 
 func TestAddOrUpdatePod_ModelServerChangePreservesMetrics(t *testing.T) {
 	inspector := &fakePodRuntimeInspector{
-		metricsFn: func(_ string, _ *corev1.Pod, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
+		metricsFn: func(_ string, _ *corev1.Pod, _ uint32, _ map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
 			return map[string]float64{
 				utils.KVCacheUsage:      0.6,
 				utils.RequestWaitingNum: 5,
@@ -1772,7 +1772,7 @@ func TestAddOrUpdatePod_ModelServerChangePreservesMetrics(t *testing.T) {
 				utils.TTFT:              0.2,
 			}, map[string]*dto.Histogram{}
 		},
-		modelsFn: func(_ string, _ *corev1.Pod) ([]string, error) {
+		modelsFn: func(_ string, _ *corev1.Pod, _ uint32) ([]string, error) {
 			return []string{"model-a"}, nil
 		},
 	}

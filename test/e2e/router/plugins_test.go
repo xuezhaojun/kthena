@@ -19,7 +19,6 @@ package router
 import (
 	"context"
 	"fmt"
-	"sync"
 	"testing"
 	"time"
 
@@ -167,21 +166,11 @@ func TestSchedulerPluginLeastLatency(t *testing.T) {
 	route := utils.CreateModelRouteFromFile(t, ctx, testCtx.KthenaClient, plugincontext.TestDataDir, testNamespace, "ModelRoute-plugins-latency.yaml")
 	model := route.Spec.ModelName
 
-	// Prime both backends while idle so the router records TTFT/TPOT; parallelize to cut wall time.
-	const primeRequests = 40
-	const primeConcurrency = 5
-	var primeWG sync.WaitGroup
-	primeWG.Add(2)
-	go func() {
-		defer primeWG.Done()
-		utils.DirectChatToPodConcurrent(t, fastPods[0], model, "kthena-router-plugin-e2e-fixed-prompt-latency-fast-prime", primeRequests, primeConcurrency)
-	}()
-	go func() {
-		defer primeWG.Done()
-		utils.DirectChatToPodConcurrent(t, slowPods[0], model, "kthena-router-plugin-e2e-fixed-prompt-latency-slow-prime", primeRequests, primeConcurrency)
-	}()
-	primeWG.Wait()
-	time.Sleep(3 * time.Second)
+	// Prime slow pool only: fast pods already have TTFT/TPOT from earlier plugin tests; an
+	// unprimed slow pod reports TTFT=0 and would incorrectly win least-latency scoring.
+	const slowPrimeRequests = 8
+	utils.DirectChatToPod(t, slowPods[0], model, "kthena-router-plugin-e2e-fixed-prompt-latency-slow-prime", slowPrimeRequests)
+	time.Sleep(2 * time.Second) // allow router to scrape updated slow-pool metrics
 
 	since := metav1.NewTime(time.Now())
 	utils.SendRouterChatRequests(t, chatURL, model, "kthena-router-plugin-e2e-fixed-prompt-latency-route", 200)

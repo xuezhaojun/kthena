@@ -24,7 +24,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -279,49 +278,29 @@ func SendRouterChatRequests(t *testing.T, routerChatURL, modelName, prompt strin
 // DirectChatToPod sends count streaming chat requests directly to a pod via port-forward.
 func DirectChatToPod(t *testing.T, pod corev1.Pod, model, prompt string, count int) {
 	t.Helper()
-	DirectChatToPodConcurrent(t, pod, model, prompt, count, 1)
-}
-
-// DirectChatToPodConcurrent sends count streaming requests with up to concurrency in flight.
-func DirectChatToPodConcurrent(t *testing.T, pod corev1.Pod, model, prompt string, count, concurrency int) {
-	t.Helper()
-	if concurrency < 1 {
-		concurrency = 1
-	}
 	localPort := AllocateLocalPort(t)
 	pf, err := SetupPortForwardToPod(pod.Namespace, pod.Name, localPort, "8000")
 	require.NoError(t, err)
 	defer pf.Close()
 
 	url := fmt.Sprintf("http://127.0.0.1:%s/v1/chat/completions", localPort)
-	body, err := json.Marshal(map[string]interface{}{
+	body, _ := json.Marshal(map[string]interface{}{
 		"model":      model,
 		"messages":   []map[string]string{{"role": "user", "content": prompt}},
 		"max_tokens": 32,
 		"stream":     true,
 	})
-	require.NoError(t, err)
-
-	sem := make(chan struct{}, concurrency)
-	var wg sync.WaitGroup
+	client := &http.Client{Timeout: 30 * time.Second}
 	for i := 0; i < count; i++ {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func() {
-			defer wg.Done()
-			defer func() { <-sem }()
-			client := &http.Client{Timeout: 2 * time.Minute}
-			req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
-			require.NoError(t, err)
-			req.Header.Set("Content-Type", "application/json")
-			resp, err := client.Do(req)
-			require.NoError(t, err)
-			_, _ = io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-			require.Equal(t, http.StatusOK, resp.StatusCode)
-		}()
+		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		require.NoError(t, err)
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
 	}
-	wg.Wait()
 }
 
 // StartSustainedLongRequestsToPod keeps concurrent long requests on one pod via port-forward.

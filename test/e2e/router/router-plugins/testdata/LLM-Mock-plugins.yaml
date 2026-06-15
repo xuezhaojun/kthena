@@ -34,8 +34,8 @@ spec:
             - --kv-cache-size=8
             - --block-size=8
             - --max-num-seqs=2
-            - --time-to-first-token=50ms
-            - --inter-token-latency=10ms
+            - --time-to-first-token=20ms
+            - --inter-token-latency=5ms
           ports:
             - containerPort: 8000
           readinessProbe:

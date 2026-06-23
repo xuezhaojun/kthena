@@ -381,7 +381,7 @@ func TestKVCacheAware_CalculatePodScores_Core(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := plugin.calculatePodScores(tt.blockHashes, tt.blockToPods)
+			result, _ := plugin.calculatePodScores(tt.blockHashes, tt.blockToPods)
 
 			if !reflect.DeepEqual(result, tt.expected) {
 				t.Errorf("Expected %v, got %v", tt.expected, result)
@@ -846,7 +846,7 @@ func TestKVCacheAware_CalculatePodScores_AdvancedCases_Core(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := plugin.calculatePodScores(tt.blockHashes, tt.blockToPods)
+			result, _ := plugin.calculatePodScores(tt.blockHashes, tt.blockToPods)
 
 			if !reflect.DeepEqual(result, tt.expected) {
 				t.Errorf("Expected %v, got %v", tt.expected, result)
@@ -1080,7 +1080,7 @@ func TestKVCacheAware_Integration_Core(t *testing.T) {
 					blockHashes[1]: {"pod1"},
 				}
 
-				scores := plugin.calculatePodScores(blockHashes, blockToPods)
+				scores, _ := plugin.calculatePodScores(blockHashes, blockToPods)
 
 				expectedScores := map[string]int{
 					"pod1": 100, // 2/2 * 100
@@ -1136,7 +1136,7 @@ func TestKVCacheAware_Integration_Core(t *testing.T) {
 					// pod1 missing block 3
 				}
 
-				scores := plugin.calculatePodScores(blockHashes, blockToPods)
+				scores, _ := plugin.calculatePodScores(blockHashes, blockToPods)
 				expected := map[string]int{
 					"pod1": 66, // 2/3 * 100 = 66.666... -> 66
 				}
@@ -1664,7 +1664,7 @@ func TestKVCacheAware_CalculatePodScores_Complex_Core(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := plugin.calculatePodScores(tt.blockHashes, tt.blockToPods)
+			result, _ := plugin.calculatePodScores(tt.blockHashes, tt.blockToPods)
 
 			if !reflect.DeepEqual(result, tt.expected) {
 				t.Errorf("Expected %v, got %v", tt.expected, result)
@@ -2056,7 +2056,7 @@ func TestKVCacheAware_Integration_Comprehensive_Core(t *testing.T) {
 					blockHashes[1]: {"pod1"},
 				}
 
-				scores := plugin.calculatePodScores(blockHashes, blockToPods)
+				scores, _ := plugin.calculatePodScores(blockHashes, blockToPods)
 				expectedScores := map[string]int{
 					"pod1": 100, // 2/2 * 100
 					"pod2": 50,  // 1/2 * 100
@@ -2147,7 +2147,7 @@ func TestKVCacheAware_CalculatePodScoresAndMatch_LongestMatch(t *testing.T) {
 		3: {"pod1"},
 		4: {"pod1"},
 	}
-	scores, longest := plugin.calculatePodScoresAndMatch(blockHashes, blockToPods)
+	scores, longest := plugin.calculatePodScores(blockHashes, blockToPods)
 	if scores["pod1"] != 100 {
 		t.Errorf("pod1 score = %d, want 100", scores["pod1"])
 	}

@@ -243,10 +243,12 @@ func (t *KVCacheAware) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 	klog.V(4).Infof("KVCacheAware.Score: Redis query took %v, blocksWithHits=%d/%d",
 		redisDuration, len(blockToPods), len(blockHashes))
 
-	podScores, longestMatch := t.calculatePodScoresAndMatch(blockHashes, blockToPods)
 	if ctx.MetricsRecorder != nil {
 		ctx.MetricsRecorder.RecordKVCacheRedisDuration(redisDuration)
-		// Fraction of the prompt's blocks matched by the best pod; 0 on a miss.
+	}
+
+	podScores, longestMatch := t.calculatePodScores(blockHashes, blockToPods)
+	if ctx.MetricsRecorder != nil {
 		ctx.MetricsRecorder.RecordKVCacheMatchRatio(matchRatio(longestMatch, len(blockHashes)))
 	}
 	scoreResults := make(map[*datastore.PodInfo]int, len(podScores))
@@ -327,13 +329,8 @@ func extractPodNameFromIdentifier(podIdentifier string) string {
 	return podIdentifier
 }
 
-func (t *KVCacheAware) calculatePodScores(blockHashes []uint64, blockToPods map[uint64][]string) map[string]int {
-	podScores, _ := t.calculatePodScoresAndMatch(blockHashes, blockToPods)
-	return podScores
-}
-
-// calculatePodScoresAndMatch also returns the longest block match length, used for the match_ratio metric.
-func (t *KVCacheAware) calculatePodScoresAndMatch(blockHashes []uint64, blockToPods map[uint64][]string) (map[string]int, int) {
+// calculatePodScores returns per-pod scores and the longest block match length (used for the match_ratio metric).
+func (t *KVCacheAware) calculatePodScores(blockHashes []uint64, blockToPods map[uint64][]string) (map[string]int, int) {
 	podScores := make(map[string]int)
 
 	if len(blockHashes) == 0 {

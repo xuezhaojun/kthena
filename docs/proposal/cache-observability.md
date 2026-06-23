@@ -21,7 +21,7 @@ This proposal adds Prometheus instrumentation to both plugins, exported through 
 
 Both plugins perform caching/matching logic that critically affects scheduling quality, yet expose no runtime telemetry:
 
-- **`prefix-cache`** is fundamentally a cache. Its effectiveness is defined by hit rate, match length, occupancy, and eviction pressure — none of which are observable.
+- **`prefix-cache`** is fundamentally a cache. Its effectiveness is defined by hit rate, match ratio, occupancy, and eviction pressure — none of which are observable.
 - **`kvcache-aware`** depends on a tokenizer round-trip and batched Redis lookups for block matching. Tokenizer and Redis latency directly bound router throughput and scoring accuracy, but are only ever logged.
 
 Without telemetry it is difficult to (1) evaluate plugin effectiveness under load, (2) locate performance bottlenecks (Redis latency, tokenizer latency), and (3) tune configuration parameters (`blockSizeToHash`, `maxBlocksToMatch`, cache capacity).
@@ -29,7 +29,7 @@ Without telemetry it is difficult to (1) evaluate plugin effectiveness under loa
 #### Goals
 
 - Export Prometheus metrics for both plugins via the router's existing `/metrics` endpoint.
-- Make cache hit rate, match length, internal latency, and error rate queryable and aggregatable, labelled by `model`.
+- Make cache hit rate, match ratio, internal latency, and error rate queryable and aggregatable, labelled by `model`.
 - Reuse the router's existing metric infrastructure and naming conventions (`kthena_router_*` prefix).
 - Ship a sample Grafana dashboard for load-test analysis.
 - Introduce no measurable regression in scoring latency.

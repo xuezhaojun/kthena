@@ -2155,3 +2155,27 @@ func TestKVCacheAware_CalculatePodScoresAndMatch_LongestMatch(t *testing.T) {
 		t.Errorf("longest match = %d, want 4", longest)
 	}
 }
+func TestKVCacheAware_CandidateFilteringRestrictsLongestMatch(t *testing.T) {
+	plugin := &KVCacheAware{}
+	blockHashes := []uint64{10, 20, 30, 40}
+	// pod3 (not a candidate) holds all 4 blocks; candidate pod1 holds only the first 2.
+	blockToPods := map[uint64][]string{
+		10: {"pod1", "pod3"},
+		20: {"pod1", "pod3"},
+		30: {"pod3"},
+		40: {"pod3"},
+	}
+
+	if _, clusterLongest := plugin.calculatePodScores(blockHashes, blockToPods); clusterLongest != 4 {
+		t.Fatalf("unfiltered longestMatch = %d, want 4 (inflated by non-candidate pod3)", clusterLongest)
+	}
+
+	// After Score() filters to candidates {pod1, pod2}, pod3 is gone and blocks 30/40 drop out.
+	candidateScoped := map[uint64][]string{
+		10: {"pod1"},
+		20: {"pod1"},
+	}
+	if _, candidateLongest := plugin.calculatePodScores(blockHashes, candidateScoped); candidateLongest != 2 {
+		t.Errorf("candidate-restricted longestMatch = %d, want 2 (pod1 holds only the first 2 blocks)", candidateLongest)
+	}
+}

@@ -235,7 +235,7 @@ func (s *ModelPrefixStore) Add(model string, hashes []uint64, pod *datastore.Pod
 	}
 }
 
-// EntryCount sums cached hash entries across all pod LRUs; read by the prefix_cache_entries gauge at scrape time.
+// EntryCount sums the number of (block-hash, pod) entries across all per-pod caches; read by the prefix_cache_entries gauge at scrape time.
 func (s *ModelPrefixStore) EntryCount() float64 {
 	s.podHashesMu.RLock()
 	defer s.podHashesMu.RUnlock()

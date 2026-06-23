@@ -247,6 +247,24 @@ func (t *KVCacheAware) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 		ctx.MetricsRecorder.RecordKVCacheRedisDuration(redisDuration)
 	}
 
+	candidateNames := make(map[string]struct{}, len(pods))
+	for _, p := range pods {
+		candidateNames[p.GetPodNamespacedName().Name] = struct{}{}
+	}
+	for hash, podNames := range blockToPods {
+		kept := podNames[:0]
+		for _, name := range podNames {
+			if _, ok := candidateNames[name]; ok {
+				kept = append(kept, name)
+			}
+		}
+		if len(kept) == 0 {
+			delete(blockToPods, hash)
+		} else {
+			blockToPods[hash] = kept
+		}
+	}
+
 	podScores, longestMatch := t.calculatePodScores(blockHashes, blockToPods)
 	if ctx.MetricsRecorder != nil {
 		ctx.MetricsRecorder.RecordKVCacheMatchRatio(matchRatio(longestMatch, len(blockHashes)))

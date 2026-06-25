@@ -17,6 +17,27 @@ When session boost is enabled, the router does the following:
 3. If yes, marks the new request as **boosted** and promotes it ahead of non-boosted requests in the queue.
 4. After a request completes, optionally enters a brief **grace period** (disabled by default) to give a potential follow-up from the same session time to arrive.
 
+The following diagram summarizes this flow:
+
+```mermaid
+flowchart TD
+    A[Incoming request] --> B[Extract session ID from SESSION_BOOST_HEADER]
+    B --> C{Session completed<br/>recently? within TTL}
+    C -- Yes --> D[Mark request as boosted<br/>promote ahead of non-boosted]
+    C -- No --> E[Enqueue as normal request]
+    D --> F{Backend has capacity?<br/>inflight limit + pod metrics}
+    E --> F
+    F -- Yes --> G[Dispatch to backend]
+    F -- No --> H[Wait / backpressure]
+    H --> F
+    G --> I[Request completes]
+    I --> J[Mark session completed<br/>start/refresh TTL]
+    J --> K{Grace period enabled?}
+    K -- Yes --> L[Briefly hold dequeue slot<br/>for same-session follow-up]
+    K -- No --> M[Immediately dequeue next request]
+    L --> M
+```
+
 ## When to Use Session Boost
 
 Session boost is designed for these scenarios:
@@ -24,13 +45,12 @@ Session boost is designed for these scenarios:
 - **Multi-turn chat applications**: ChatGPT-like interfaces where users have back-and-forth conversations with an LLM. Each turn builds on the previous conversation context.
 - **Agentic workflows and RAG chains**: Automated pipelines that issue multiple sequential requests in the same session, where each request depends on the previous response.
 - **Low-latency prefix cache optimization**: Workloads where minimizing TTFT is critical and the same session's requests benefit from being processed back-to-back on warm KV cache.
-- **Environments without fairness requirements**: When you want prefix cache optimization without the complexity of multi-tenant fairness scheduling.
+- **Prefix cache optimization instead of per-user fairness**: When you want the shared fairness queue to prioritize warm KV cache reuse rather than equitable per-user resource sharing.
 
 Session boost is **not** needed when:
 
 - Your workload is single-turn (independent requests with no shared prefix).
-- Requests are already routed with session sticky and no queuing contention exists.
-- You need multi-tenant fairness as the primary scheduling concern (use [fairness scheduling](./fairness-scheduling) instead).
+- You need multi-tenant fairness as the primary scheduling concern (use [fairness scheduling](./fairness-scheduling) instead). Session sticky routing is complementary and can be combined with session boost (see [Operational Notes](#operational-notes)).
 
 ## Prerequisites
 
@@ -90,15 +110,15 @@ env:
 
 ## Configuration Reference
 
-| Environment Variable          | Purpose                                                                    | Default      | Notes                                                                                                                                                                                                                                       |
-| ----------------------------- | -------------------------------------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ENABLE_FAIRNESS_SCHEDULING`  | Enable the fairness queue (required for session boost)                     | `false`      | Session boost is a mode of this queue; it is ignored unless this is `true`                                                                                                                                                                  |
-| `ENABLE_SESSION_BOOST`        | Enable session-boost mode on the fairness queue                            | `false`      | Requires `ENABLE_FAIRNESS_SCHEDULING=true`                                                                                                                                                                                                  |
-| `SESSION_BOOST_HEADER`        | HTTP header used to identify conversation sessions                         | *(required)* | Must match what your clients send                                                                                                                                                                                                           |
-| `SESSION_BOOST_TTL`           | Duration after which a session's boost expires                             | `60s`        | Longer values help slow human conversations; shorter values suit fast automated pipelines                                                                                                                                                   |
-| `SESSION_BOOST_GRACE_PERIOD`  | Wait time after a request completes for a same-session follow-up to arrive | `0`          | Disabled by default. Only enable (e.g., `50ms`) if you understand the latency trade-off for non-boosted requests                                                                                                                            |
-| `SESSION_BOOST_POLL_INTERVAL` | Backend capacity polling interval                                          | `100ms`      | Lower values reduce latency but increase polling load                                                                                                                                                                                       |
-| `FAIRNESS_MAX_CONCURRENT`     | Total inflight requests admitted to backends (session-boost mode)          | `16`         | Reused from fairness scheduling. It is a **global** limit, not per-pod. In session-boost mode you must size it yourself based on the estimated per-pod concurrency (e.g., vLLM's `--max-num-seqs`) multiplied by the number of backend pods |
+| Environment Variable          | Purpose                                                                           | Default      | Notes                                                                                                                                                                                                                                       |
+| ----------------------------- | --------------------------------------------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ENABLE_FAIRNESS_SCHEDULING`  | Enable the fairness queue (required for session boost)                            | `false`      | Session boost is a mode of this queue; it is ignored unless this is `true`                                                                                                                                                                  |
+| `ENABLE_SESSION_BOOST`        | Enable session-boost mode on the fairness queue                                   | `false`      | Requires `ENABLE_FAIRNESS_SCHEDULING=true`                                                                                                                                                                                                  |
+| `SESSION_BOOST_HEADER`        | HTTP header used to identify conversation sessions                                | *(required)* | Must match what your clients send                                                                                                                                                                                                           |
+| `SESSION_BOOST_TTL`           | Duration after which a session's boost expires                                    | `60s`        | Longer values help slow human conversations; shorter values suit fast automated pipelines                                                                                                                                                   |
+| `SESSION_BOOST_GRACE_PERIOD`  | Wait time after a request completes for a same-session follow-up to arrive        | `0`          | Disabled by default. Only enable (e.g., `50ms`) if you understand the latency trade-off for non-boosted requests                                                                                                                            |
+| `SESSION_BOOST_POLL_INTERVAL` | Interval at which the queue polls backend pod metrics to check available capacity | `100ms`      | Lower values react faster to capacity changes but increase metrics polling load                                                                                                                                                             |
+| `FAIRNESS_MAX_CONCURRENT`     | Total inflight requests admitted to backends (session-boost mode)                 | `16`         | Reused from fairness scheduling. It is a **global** limit, not per-pod. In session-boost mode you must size it yourself based on the estimated per-pod concurrency (e.g., vLLM's `--max-num-seqs`) multiplied by the number of backend pods |
 
 ## Client Integration
 

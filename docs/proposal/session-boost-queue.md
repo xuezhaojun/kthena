@@ -35,7 +35,7 @@ Enabling session boost therefore reconfigures the same per-model priority queue 
 #### Goals
 
 1. **Simple activation**: Session boost can be enabled via `ENABLE_SESSION_BOOST=true` on top of fairness scheduling (`ENABLE_FAIRNESS_SCHEDULING=true`). Because session boost is a mode of the fairness queue, fairness scheduling is a prerequisite; if session boost is requested without it, the router logs a warning and ignores it.
-2. **Configurable session identification**: Users can configure which HTTP header identifies conversation sessions via `SESSION_BOOST_HEADER` (defaults to `X-Correlation-ID`).
+2. **Configurable session identification**: Users can configure which HTTP header identifies conversation sessions via `SESSION_BOOST_HEADER` (e.g., `X-Session-ID`).
 3. **Prefix cache optimization**: Prioritize follow-up requests from recently completed sessions to maximize warm cache hits.
 4. **Grace period**: After a request completes, briefly hold the dequeue slot for a potential follow-up from the same session before dispatching unrelated requests.
 5. **Backpressure-aware**: Respect backend pod capacity to avoid flooding, using two-level admission control (inflight limit + backend metrics).
@@ -169,15 +169,15 @@ Timeline:
 
 #### Configuration
 
-| Environment Variable          | Default            | Description                                                                                                                                                                                   |
-| ----------------------------- | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ENABLE_FAIRNESS_SCHEDULING`  | `false`            | Enable the fairness queue. Required for session boost, which runs as a mode of this queue                                                                                                     |
-| `ENABLE_SESSION_BOOST`        | `false`            | Enable session-boost mode on the fairness queue (requires `ENABLE_FAIRNESS_SCHEDULING=true`)                                                                                                  |
-| `SESSION_BOOST_HEADER`        | `X-Correlation-ID` | HTTP header used to identify conversation sessions                                                                                                                                            |
-| `SESSION_BOOST_TTL`           | `60s`              | Duration after which a session boost expires                                                                                                                                                  |
-| `SESSION_BOOST_GRACE_PERIOD`  | `0`                | Wait time after release for same-session follow-up. Disabled by default; enable only when you understand the latency trade-off                                                                |
-| `SESSION_BOOST_POLL_INTERVAL` | `100ms`            | Backend capacity polling interval                                                                                                                                                             |
-| `FAIRNESS_MAX_CONCURRENT`     | `16`               | Reused from fairness scheduling as the global (total) inflight limit in session-boost mode. Operators size it from the estimated per-pod concurrency multiplied by the number of backend pods |
+| Environment Variable          | Default        | Description                                                                                                                                                                                   |
+| ----------------------------- | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ENABLE_FAIRNESS_SCHEDULING`  | `false`        | Enable the fairness queue. Required for session boost, which runs as a mode of this queue                                                                                                     |
+| `ENABLE_SESSION_BOOST`        | `false`        | Enable session-boost mode on the fairness queue (requires `ENABLE_FAIRNESS_SCHEDULING=true`)                                                                                                  |
+| `SESSION_BOOST_HEADER`        | `X-Session-ID` | HTTP header used to identify conversation sessions                                                                                                                                            |
+| `SESSION_BOOST_TTL`           | `60s`          | Duration after which a session boost expires                                                                                                                                                  |
+| `SESSION_BOOST_GRACE_PERIOD`  | `0`            | Wait time after release for same-session follow-up. Disabled by default; enable only when you understand the latency trade-off                                                                |
+| `SESSION_BOOST_POLL_INTERVAL` | `100ms`        | Backend capacity polling interval                                                                                                                                                             |
+| `FAIRNESS_MAX_CONCURRENT`     | `16`           | Reused from fairness scheduling as the global (total) inflight limit in session-boost mode. Operators size it from the estimated per-pod concurrency multiplied by the number of backend pods |
 
 ### Design Details
 
@@ -223,11 +223,11 @@ type RequestPriorityQueue struct {
 
 #### Session Identification
 
-Sessions are identified by a configurable HTTP header (default: `X-Correlation-ID`, controlled by `SESSION_BOOST_HEADER` environment variable). This is a client-provided identifier that groups related requests in a multi-turn conversation:
+Sessions are identified by a configurable HTTP header (default: `X-Session-ID`, controlled by `SESSION_BOOST_HEADER` environment variable). This is a client-provided identifier that groups related requests in a multi-turn conversation:
 
 ```
 POST /v1/chat/completions
-X-Correlation-ID: conv-abc-123
+X-Session-ID: conv-abc-123
 X-Request-ID: req-001
 
 {"model": "llama-3", "messages": [...]}
@@ -240,7 +240,7 @@ Operators can customize the header name to match their client conventions:
 export SESSION_BOOST_HEADER="X-Session-ID"
 ```
 
-When a request with the configured session header (e.g., `X-Correlation-ID: conv-abc-123`) completes successfully, the session tracker records the completion time. Any subsequent request within the TTL window that carries the same session identifier will be marked as session-boosted and promoted to the head of the queue.
+When a request with the configured session header (e.g., `X-Session-ID: conv-abc-123`) completes successfully, the session tracker records the completion time. Any subsequent request within the TTL window that carries the same session identifier will be marked as session-boosted and promoted to the head of the queue.
 
 #### Backpressure Control
 
@@ -273,7 +273,7 @@ Human users typically take 1-50ms between receiving a response and submitting th
 
 #### 3. No User ID Requirement for Priority
 
-Session boost derives priority from the configured session header (default: `X-Correlation-ID`) rather than the user identity. Even though it runs as a mode of the fairness queue, the session-boost ordering does not depend on a user ID, so prefix cache optimization works for unauthenticated requests (which are simply enqueued without a boost until their session completes once).
+Session boost derives priority from the configured session header (default: `X-Session-ID`) rather than the user identity. Even though it runs as a mode of the fairness queue, the session-boost ordering does not depend on a user ID, so prefix cache optimization works for unauthenticated requests (which are simply enqueued without a boost until their session completes once).
 
 #### 4. Complementary with Session Sticky
 

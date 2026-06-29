@@ -2524,7 +2524,7 @@ func TestManageRoleReplicasWithPartitionProtectedServingGroupAlignsToControllerR
 	controller.store.AddServingGroup(utils.GetNamespaceName(ms), groupOrdinal, oldRevision)
 	controller.store.AddRole(utils.GetNamespaceName(ms), groupName, roleName, utils.GenerateRoleID(roleName, 0), oldRevision, "roleTemplateHash")
 
-	err = controller.syncRoleWithinServingGroups(context.Background(), ms, newRevision)
+	err = controller.syncRoleReplicas(context.Background(), ms, newRevision)
 	assert.NoError(t, err)
 
 	roles, err := controller.store.GetRoleList(utils.GetNamespaceName(ms), groupName, roleName)
@@ -2673,7 +2673,7 @@ func TestManageRoleReplicas(t *testing.T) {
 				assert.NoError(t, controller.podsInformer.GetIndexer().Add(entryPod))
 			}
 
-			controller.manageRoleReplicas(context.Background(), ms, groupName, ms.Spec.Template.Roles[0], 0, revision)
+			controller.manageRoleReplicasPerGroup(context.Background(), ms, groupName, ms.Spec.Template.Roles[0], 0, revision)
 
 			roles, err := controller.store.GetRoleList(utils.GetNamespaceName(ms), groupName, roleName)
 			assert.NoError(t, err)
@@ -7417,8 +7417,7 @@ func TestFindOutdatedRolesInServingGroups(t *testing.T) {
 			// Calculate expected role template hashes from ModelServing spec
 			expectedRoleTemplateHashes := make(map[string]string)
 			for _, role := range ms.Spec.Template.Roles {
-				copy := utils.RemoveRoleReplicasForRoleTemplateHash(role)
-				roleTemplateHash := utils.Revision(copy)
+				roleTemplateHash := utils.CalRoleTemplateHash(role)
 				expectedRoleTemplateHashes[role.Name] = roleTemplateHash
 			}
 

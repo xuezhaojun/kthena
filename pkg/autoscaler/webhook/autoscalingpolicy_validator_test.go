@@ -295,7 +295,7 @@ func TestValidateAutoscalingPolicy_DisaggregatedSingleRoleAndFixedRole(t *testin
 	}
 	allowed, msg = validator.validateAutoscalingPolicy(ratioSingleRolePolicy)
 	assert.False(t, allowed)
-	assert.Contains(t, msg, "at least two roles must be set when ratioConstraint is configured")
+	assert.Contains(t, msg, "denominatorRole must exist in roles")
 }
 
 func TestAutoscalingPolicyValidator_Handle_ValidPolicy(t *testing.T) {

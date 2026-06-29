@@ -131,6 +131,7 @@ func (autoscaler *DisaggregatedAutoscaler) Scale(ctx context.Context, podLister 
 
 	correctedReplicas := make(map[string]int32, len(autoscaler.Meta.Config.Roles))
 	desiredReplicas := make(map[string]int32, len(autoscaler.Meta.Config.Roles))
+	scaleResults := make(map[string]scaleOneTargetResult, len(autoscaler.Meta.Config.Roles))
 	bounds := make(map[string]algorithm.ReplicaBounds, len(autoscaler.Meta.Config.Roles))
 	roleNames := make([]string, 0, len(autoscaler.Meta.Config.Roles))
 
@@ -170,43 +171,25 @@ func (autoscaler *DisaggregatedAutoscaler) Scale(ctx context.Context, podLister 
 			return nil, fmt.Errorf("update metrics for role %s: %w", roleName, err)
 		}
 
-		// RecommendedInstancesAlgorithm keeps the existing HPA-like rule: compute
-		// one desired count per metric and use the maximum signal for this role.
-		instancesAlgorithm := algorithm.RecommendedInstancesAlgorithm{
-			MinInstances:          roleParam.MinReplicas,
-			MaxInstances:          roleParam.MaxReplicas,
-			CurrentInstancesCount: current,
-			Tolerance:             float64(policy.Spec.TolerancePercent) * 0.01,
+		scaleResult := scaleOneTarget(scaleOneTargetInput{
+			Status:                status,
+			Behavior:              &policy.Spec.Behavior,
+			MinReplicas:           roleParam.MinReplicas,
+			MaxReplicas:           roleParam.MaxReplicas,
+			CurrentReplicas:       current,
+			TolerancePercent:      policy.Spec.TolerancePercent,
 			MetricTargets:         collector.MetricTargets,
 			UnreadyInstancesCount: unreadyInstancesCount,
-			ReadyInstancesMetrics: []algorithm.Metrics{readyInstancesMetrics},
+			ReadyInstancesMetrics: readyInstancesMetrics,
 			ExternalMetrics:       externalMetrics,
+		})
+		if scaleResult.Skip {
+			klog.InfoS("skip disaggregated scaling because role metrics are unavailable", "role", roleName)
+			return nil, nil
 		}
-		recommended, skip := instancesAlgorithm.GetRecommendedInstances()
-		if skip {
-			klog.InfoS("skip recommended instances for disaggregated role", "role", roleName)
-			recommended = current
-		}
-		desiredReplicas[roleName] = recommended
-
-		// Behavior correction remains independent per role so one role's history or
-		// panic mode does not throttle another role with a different traffic shape.
-		if policy.Spec.Behavior.ScaleUp.PanicPolicy.PanicThresholdPercent != nil && recommended*100 >= current*(*policy.Spec.Behavior.ScaleUp.PanicPolicy.PanicThresholdPercent) {
-			status.RefreshPanicMode()
-		}
-		correctedAlgorithm := algorithm.CorrectedInstancesAlgorithm{
-			IsPanic:              status.IsPanicMode(),
-			History:              status.History,
-			Behavior:             &policy.Spec.Behavior,
-			MinInstances:         roleParam.MinReplicas,
-			MaxInstances:         roleParam.MaxReplicas,
-			CurrentInstances:     current,
-			RecommendedInstances: recommended,
-		}
-		corrected := correctedAlgorithm.GetCorrectedInstances()
-		correctedReplicas[roleName] = corrected
-		status.AppendRecommendation(recommended)
-		status.AppendCorrected(corrected)
+		desiredReplicas[roleName] = scaleResult.RecommendedReplicas
+		correctedReplicas[roleName] = scaleResult.CorrectedReplicas
+		scaleResults[roleName] = scaleResult
 	}
 
 	// Ratio enforcement is intentionally applied after per-role behavior
@@ -214,6 +197,9 @@ func (autoscaler *DisaggregatedAutoscaler) Scale(ctx context.Context, podLister 
 	finalReplicas, ratioAdjusted, currentRatio, err := algorithm.EnforceRoleRatio(correctedReplicas, bounds, autoscaler.Meta.Config.RatioConstraint)
 	if err != nil {
 		return nil, err
+	}
+	for roleName, scaleResult := range scaleResults {
+		recordScaleOneTargetResult(autoscaler.Statuses[roleName], scaleResult)
 	}
 
 	// Build the status payload after ratio enforcement so the controller can show

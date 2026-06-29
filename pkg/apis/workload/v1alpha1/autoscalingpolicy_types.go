@@ -480,6 +480,7 @@ type HeterogeneousTargetParam struct {
 
 // DisaggregatedTarget defines coordinated autoscaling for disaggregated
 // serving roles within a single ModelServing deployment.
+// +kubebuilder:validation:XValidation:rule="!has(self.ratioConstraint) || size(self.roles) >= 2",message="roles must contain at least two entries when ratioConstraint is configured"
 type DisaggregatedTarget struct {
 	// TargetRef references the ModelServing deployment that contains
 	// all scalable roles.

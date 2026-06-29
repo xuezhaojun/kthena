@@ -45,7 +45,16 @@ import (
 type fakePodNamespaceLister struct{ pods []*corev1.Pod }
 
 func (f fakePodNamespaceLister) List(selector labels.Selector) ([]*corev1.Pod, error) {
-	return f.pods, nil
+	if !strings.Contains(selector.String(), workload.RoleLabelKey) {
+		return f.pods, nil
+	}
+	res := []*corev1.Pod{}
+	for _, pod := range f.pods {
+		if selector.Matches(labels.Set(pod.Labels)) {
+			res = append(res, pod)
+		}
+	}
+	return res, nil
 }
 func (f fakePodNamespaceLister) Get(name string) (*corev1.Pod, error) {
 	for _, p := range f.pods {
@@ -61,7 +70,15 @@ type fakePodLister struct{ podsByNs map[string][]*corev1.Pod }
 func (f fakePodLister) List(selector labels.Selector) ([]*corev1.Pod, error) {
 	res := []*corev1.Pod{}
 	for _, ps := range f.podsByNs {
-		res = append(res, ps...)
+		if !strings.Contains(selector.String(), workload.RoleLabelKey) {
+			res = append(res, ps...)
+			continue
+		}
+		for _, pod := range ps {
+			if selector.Matches(labels.Set(pod.Labels)) {
+				res = append(res, pod)
+			}
+		}
 	}
 	return res, nil
 }
@@ -287,11 +304,18 @@ func TestDoDisaggregatedScale_RatioRaisesDecode(t *testing.T) {
 
 	client := clientfake.NewSimpleClientset(ms.DeepCopy(), policy.DeepCopy())
 	msLister := workloadLister.NewModelServingLister(newModelServingIndexer(ms.DeepCopy()))
-	pods := []*corev1.Pod{readyPod(ns, "pod-pd", host, map[string]string{
-		workload.ModelServingNameLabelKey: "ms-pd",
-		workload.EntryLabelKey:            "true",
-		workload.RoleLabelKey:             "prefill",
-	})}
+	pods := []*corev1.Pod{
+		readyPod(ns, "pod-pd-prefill", host, map[string]string{
+			workload.ModelServingNameLabelKey: "ms-pd",
+			workload.EntryLabelKey:            "true",
+			workload.RoleLabelKey:             "prefill",
+		}),
+		readyPod(ns, "pod-pd-decode", host, map[string]string{
+			workload.ModelServingNameLabelKey: "ms-pd",
+			workload.EntryLabelKey:            "true",
+			workload.RoleLabelKey:             "decode",
+		}),
+	}
 	ac := &AutoscaleController{
 		client:                 client,
 		modelServingLister:     msLister,

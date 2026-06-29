@@ -20,7 +20,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"reflect"
 	"time"
 
 	"github.com/volcano-sh/kthena/pkg/autoscaler/autoscaler"
@@ -32,6 +31,7 @@ import (
 	workload "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
 	"github.com/volcano-sh/kthena/pkg/autoscaler/util"
 	"istio.io/istio/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -356,6 +356,9 @@ func (ac *AutoscaleController) doDisaggregatedScale(ctx context.Context, autosca
 
 		return err
 	}
+	if result == nil {
+		return nil
+	}
 	if err := ac.updateTargetRoleReplicas(ctx, target, autoscalePolicy.Namespace, finalReplicasByRole(result.Roles)); err != nil {
 		if err := ac.updateDisaggregatedPolicyStatus(ctx, autoscalePolicy, result, err, true); err != nil {
 			klog.Warningf("failed to update disaggregated autoscaling policy status %s/%s: %v", autoscalePolicy.Namespace, autoscalePolicy.Name, err)
@@ -454,8 +457,8 @@ func (ac *AutoscaleController) updateTargetRoleReplicas(ctx context.Context, tar
 	}
 	patches := make([]jsonPatchOperation, 0, len(desiredReplicas))
 	for roleName, desired := range desiredReplicas {
-		roleIndex, current, found := getRoleReplica(modelServing, roleName)
-		if !found {
+		roleIndex, current := getRoleReplica(modelServing, roleName)
+		if roleIndex < 0 {
 			return fmt.Errorf("role %s not found in model serving %s/%s", roleName, modelServing.Namespace, modelServing.Name)
 		}
 		if current == desired {
@@ -485,7 +488,7 @@ func (ac *AutoscaleController) updateTargetRoleReplicas(ctx context.Context, tar
 	return err
 }
 
-func getRoleReplica(modelServing *workload.ModelServing, roleName string) (int, int32, bool) {
+func getRoleReplica(modelServing *workload.ModelServing, roleName string) (int, int32) {
 	for i, role := range modelServing.Spec.Template.Roles {
 		if role.Name != roleName {
 			continue
@@ -494,16 +497,20 @@ func getRoleReplica(modelServing *workload.ModelServing, roleName string) (int, 
 		if role.Replicas != nil {
 			replicas = *role.Replicas
 		}
-		return i, replicas, true
+		return i, replicas
 	}
-	return -1, 0, false
+	return -1, 0
 }
 
 // updateDisaggregatedPolicyStatus writes status for the last disaggregated
 // reconcile. Ready reports the overall reconcile result, while TargetFound only
 // reports whether the referenced ModelServing and configured roles were resolved.
 func (ac *AutoscaleController) updateDisaggregatedPolicyStatus(ctx context.Context, policy *workload.AutoscalingPolicy, result *autoscaler.DisaggregatedScaleResult, reconcileErr error, targetFound bool) error {
-	policyCopy := policy.DeepCopy()
+	policyCopy := &workload.AutoscalingPolicy{
+		TypeMeta:   policy.TypeMeta,
+		ObjectMeta: *policy.ObjectMeta.DeepCopy(),
+		Status:     *policy.Status.DeepCopy(),
+	}
 	policyCopy.Status.ObservedGeneration = policy.Generation
 	policyCopy.Status.HomogeneousStatus = nil
 	policyCopy.Status.HeterogeneousStatus = nil
@@ -573,7 +580,7 @@ func (ac *AutoscaleController) updateDisaggregatedPolicyStatus(ctx context.Conte
 		}
 	}
 
-	if reflect.DeepEqual(policy.Status, policyCopy.Status) {
+	if equality.Semantic.DeepEqual(policy.Status, policyCopy.Status) {
 		return nil
 	}
 	_, err := ac.client.WorkloadV1alpha1().AutoscalingPolicies(policy.Namespace).UpdateStatus(ctx, policyCopy, metav1.UpdateOptions{})

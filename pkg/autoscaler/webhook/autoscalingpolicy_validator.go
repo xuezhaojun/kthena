@@ -224,18 +224,10 @@ func (v *AutoscalingPolicyValidator) validateDisaggregatedTarget(policy *registr
 	}
 
 	disaggregatedPath := field.NewPath("spec").Child("disaggregatedTarget")
-	// Single-role policies are valid for role-level autoscaling. A ratio constraint
-	// is the only case that requires two roles, because it references a role pair.
-	if len(target.Roles) < 1 {
-		allErrs = append(allErrs, field.Invalid(disaggregatedPath.Child("roles"), len(target.Roles), "at least one role must be set"))
-	}
-	if target.RatioConstraint != nil && len(target.Roles) < 2 {
-		allErrs = append(allErrs, field.Invalid(disaggregatedPath.Child("roles"), len(target.Roles), "at least two roles must be set when ratioConstraint is configured"))
-	}
 
 	for roleName, roleParam := range target.Roles {
 		if roleName == "" {
-			allErrs = append(allErrs, field.Invalid(disaggregatedPath.Child("roles"), roleName, "role name must be a role from ModelServing.spec.template.roles[].name not be empty"))
+			allErrs = append(allErrs, field.Invalid(disaggregatedPath.Child("roles"), roleName, "role name must refer to a ModelServing.spec.template.roles[].name and must not be empty"))
 			continue
 		}
 		rolePath := disaggregatedPath.Child("roles").Key(roleName)

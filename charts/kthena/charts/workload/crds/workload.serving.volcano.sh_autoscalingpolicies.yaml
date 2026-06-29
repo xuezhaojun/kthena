@@ -451,6 +451,10 @@ spec:
                 - roles
                 - targetRef
                 type: object
+                x-kubernetes-validations:
+                - message: roles must contain at least two entries when ratioConstraint
+                    is configured
+                  rule: '!has(self.ratioConstraint) || size(self.roles) >= 2'
               heterogeneousTarget:
                 description: |-
                   HeterogeneousTarget enables optimization-based scaling across multiple

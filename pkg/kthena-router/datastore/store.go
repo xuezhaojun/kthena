@@ -567,16 +567,6 @@ func (s *store) Run(ctx context.Context) {
 				return true
 			})
 			s.initialSynced.Store(true)
-			// Backend pod metrics just refreshed; wake any session-boost queue so it
-			// can re-check capacity for requests it is holding. The capacity check
-			// reads these cached metrics, so this is the moment fresh data is
-			// available. The notify is a no-op for non-session-boost queues.
-			s.requestWaitingQueue.Range(func(_, value any) bool {
-				if q, ok := value.(*RequestPriorityQueue); ok {
-					q.NotifyBackendMetricsRefreshed()
-				}
-				return true
-			})
 			select {
 			case <-ctx.Done():
 				return

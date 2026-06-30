@@ -466,60 +466,6 @@ func TestSessionBoostQueue_GracePeriod_NoBoostArrives(t *testing.T) {
 	}
 }
 
-func TestSessionBoostQueue_DirectMode(t *testing.T) {
-	// Without a backend checker, the queue should dequeue immediately
-	cfg := sessionBoostConfig()
-	q := newSessionBoostQueue(cfg, nil)
-	defer q.Close()
-
-	q.MarkSessionRequestCompleted("session-1")
-
-	now := time.Now()
-	normalReq := &Request{
-		UserID:      "user-A",
-		ModelName:   "model-1",
-		SessionID:   "other",
-		RequestTime: now,
-		NotifyChan:  make(chan struct{}),
-	}
-	boostReq := &Request{
-		UserID:      "user-B",
-		ModelName:   "model-1",
-		SessionID:   "session-1",
-		RequestTime: now.Add(time.Millisecond),
-		NotifyChan:  make(chan struct{}),
-	}
-
-	if err := q.PushRequest(normalReq); err != nil {
-		t.Fatalf("PushRequest failed: %v", err)
-	}
-	if err := q.PushRequest(boostReq); err != nil {
-		t.Fatalf("PushRequest failed: %v", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	go q.Run(ctx, 0)
-
-	// In direct mode, boosted should be dequeued first since it has higher heap priority
-	select {
-	case <-boostReq.NotifyChan:
-		// Good: boosted was first
-	case <-normalReq.NotifyChan:
-		t.Error("Expected boosted request to be dequeued first in direct mode")
-	case <-time.After(2 * time.Second):
-		t.Fatal("Timeout waiting for first dequeue")
-	}
-
-	// Then normal
-	select {
-	case <-normalReq.NotifyChan:
-		// Good
-	case <-time.After(2 * time.Second):
-		t.Fatal("Timeout waiting for second dequeue")
-	}
-}
-
 func TestSessionBoostQueue_CancelledRequestsSkipped(t *testing.T) {
 	cfg := sessionBoostConfig()
 	q := newSessionBoostQueue(cfg, nil)

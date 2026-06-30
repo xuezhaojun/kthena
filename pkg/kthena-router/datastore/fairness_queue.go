@@ -174,16 +174,10 @@ type RequestPriorityQueue struct {
 	// of per-user fairness, and dequeues using backend backpressure.
 	sessionBoost   bool
 	sessionTracker *SessionTracker       // Tracks recently completed sessions for boosting
-	backendChecker BackendWaitingChecker // Optional; gates dequeue on backend capacity
+	backendChecker BackendWaitingChecker // Gates dequeue on backend capacity in session-boost mode
 	podCounter     PodCounter            // Optional; counts backend pods for inflight scaling
 	inflightCount  atomic.Int64          // In-flight requests in session-boost mode
 	releaseCh      chan struct{}         // Signals a permit release in session-boost mode
-	// metricsRefreshCh wakes the backpressure dequeue loop after the store refreshes
-	// backend pod metrics. The capacity check reads cached pod metrics, which only
-	// change on the store's scrape cycle; a release/arrival can therefore observe a
-	// stale "busy" value. This signal lets the loop re-check exactly when fresh
-	// metrics are available, replacing a blind timer. nil unless session boost is on.
-	metricsRefreshCh chan struct{}
 }
 
 var _ heap.Interface = &RequestPriorityQueue{}
@@ -194,8 +188,8 @@ func NewRequestPriorityQueue(metricsInstance *metrics.Metrics) *RequestPriorityQ
 }
 
 // NewRequestPriorityQueueWithConfig creates a priority queue with explicit configuration.
-// When cfg.SessionBoostEnabled is true the queue operates in session-boost mode; an
-// optional BackendWaitingChecker (nil to disable) gates dequeue on backend capacity.
+// When cfg.SessionBoostEnabled is true the queue operates in session-boost mode, where
+// the BackendWaitingChecker gates dequeue on backend capacity.
 func NewRequestPriorityQueueWithConfig(metricsInstance *metrics.Metrics, cfg FairnessQueueConfig, tracker TokenTracker, checker BackendWaitingChecker) *RequestPriorityQueue {
 	if metricsInstance == nil {
 		metricsInstance = metrics.DefaultMetrics
@@ -219,7 +213,6 @@ func NewRequestPriorityQueueWithConfig(metricsInstance *metrics.Metrics, cfg Fai
 		}
 		pq.sessionTracker = NewSessionTracker(maxSessions)
 		pq.releaseCh = make(chan struct{}, 1)
-		pq.metricsRefreshCh = make(chan struct{}, 1)
 		pq.backendChecker = checker
 	} else if cfg.MaxConcurrent > 0 {
 		pq.sem = make(chan struct{}, cfg.MaxConcurrent)
@@ -426,8 +419,9 @@ func (pq *RequestPriorityQueue) requeueRequest(req *Request) {
 }
 
 // Run starts the dequeue loop. In session-boost mode, dequeue is gated by backend
-// backpressure. Otherwise, in semaphore mode (MaxConcurrent > 0), dequeue is gated
-// by available capacity, and as a final fallback it uses QPS-based ticker dequeue.
+// backpressure and a per-pod inflight limit. Otherwise, in semaphore mode
+// (MaxConcurrent > 0), dequeue is gated by available capacity, and as a final
+// fallback it uses QPS-based ticker dequeue.
 func (pq *RequestPriorityQueue) Run(ctx context.Context, qps int) {
 	if pq.sessionBoost {
 		pq.runSessionBoostMode(ctx)

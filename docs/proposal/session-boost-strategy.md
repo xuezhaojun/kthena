@@ -211,7 +211,7 @@ Release frees a slot
 
 Two interactions are worth calling out explicitly:
 
-- **Grace never overrides backpressure.** If the grace window ends but the inflight limit is already reached or every backend pod is busy, the request is **not** admitted — `tryBackpressureDequeue` simply holds (and drains any cancelled requests from the heap) until the next release, new arrival, or metrics-refresh signal reopens the gates. Grace only chooses *who* tries next; the capacity gates decide *whether* anyone runs.
+- **Grace never overrides backpressure.** If the grace window ends but the inflight limit is already reached or every backend pod is busy, the request is **not** admitted — `tryBackpressureDequeue` simply holds (and drains any cancelled requests from the heap) until the next release or new arrival reopens the gates. Grace only chooses *who* tries next; the capacity gates decide *whether* anyone runs.
 - **Fresh arrivals on an idle queue bypass grace.** Grace is tied to `releaseCh` (a freed slot), not to `notifyCh` (a new arrival). When a request lands on an otherwise idle queue with no pending release, it goes straight to the capacity gates with no grace delay, so enabling grace adds no admission latency to first turns. The only place a new arrival waits is *inside* an already-running grace window, where it is precisely the boosted follow-up the window exists to catch. When both a release and a new arrival are pending at once, the release is preferred so the freed slot is the one held for the grace window.
 
 The net effect is a strict precedence: **grace timing → inflight gate → backend gate**. The grace layer is purely additive and optional (`SessionBoostGracePeriod = 0` removes it entirely, taking the no-grace fast path), and it can only ever *delay* an admission to favor a session-boosted follow-up — it can never admit a request that the inflight or backend gates would otherwise reject.
@@ -260,7 +260,6 @@ type RequestPriorityQueue struct {
     backendChecker BackendWaitingChecker // Backend capacity gate
     inflightCount  atomic.Int64          // Current inflight requests
     releaseCh      chan struct{}         // Release-driven dequeue signal
-    metricsRefreshCh chan struct{}       // Store signals it after each metrics scrape
 }
 
 // Session-boost ordering (RequestPriorityQueue.Less when sessionBoost == true):
@@ -296,7 +295,7 @@ The queue uses two-level admission control:
 1. **Inflight limit**: At most `InflightPerPod` requests can be in-flight per backend pod; the total limit scales with pod count (`SESSION_BOOST_INFLIGHT_PER_POD`). This prevents flooding backends between metric scrapes.
 2. **Backend metrics check**: The `BackendWaitingChecker` reads the backend pod metrics already scraped by the store (e.g., vLLM's `RequestWaitingNum`) to confirm at least one pod has capacity. It does not scrape backends itself.
 
-When a request completes (Release), the queue immediately attempts to dequeue the next request (release-driven dequeue), ensuring minimal latency between sequential requests. The loop is fully event-driven — there is no independent polling timer. Because the capacity check reads cached metrics that change only on the store's scrape cycle, the store signals each session-boost queue right after it refreshes pod metrics (`METRICS_SCRAPE_INTERVAL`), waking any queue that is holding requests so it can re-check exactly when fresh data is available.
+When a request completes (Release), the queue immediately attempts to dequeue the next request (release-driven dequeue), ensuring minimal latency between sequential requests. The loop is fully event-driven — there is no independent polling timer. In single-router operation every moment a backend frees capacity coincides with one of our own requests completing (a release), so release and arrival events alone cover every dequeue opportunity; the capacity check simply reads the pod metrics already scraped by the store (`METRICS_SCRAPE_INTERVAL`).
 
 ### Multi-Turn Conversation Advantages
 

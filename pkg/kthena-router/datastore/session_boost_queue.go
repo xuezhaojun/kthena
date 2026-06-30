@@ -123,16 +123,6 @@ func (pq *RequestPriorityQueue) GetInflightCount() int64 {
 	return pq.inflightCount.Load()
 }
 
-// runSessionBoostMode is the session-boost dequeue loop. It uses backend backpressure
-// when a checker is configured, otherwise dequeues directly (no rate limiting).
-func (pq *RequestPriorityQueue) runSessionBoostMode(ctx context.Context) {
-	if pq.backendChecker != nil {
-		pq.runBackpressureMode(ctx)
-		return
-	}
-	pq.runDirectMode(ctx)
-}
-
 // admitSessionBoost marks a request as inflight, installs its release callback and
 // unblocks the waiting caller by closing its NotifyChan.
 func (pq *RequestPriorityQueue) admitSessionBoost(req *Request) {
@@ -165,47 +155,16 @@ func (pq *RequestPriorityQueue) admitSessionBoost(req *Request) {
 	}
 }
 
-// runDirectMode dequeues requests as fast as they arrive with no rate limiting.
-func (pq *RequestPriorityQueue) runDirectMode(ctx context.Context) {
-	for {
-		req, err := pq.popWhenAvailable(ctx)
-		if err != nil {
-			return
-		}
-		if req == nil || req.NotifyChan == nil {
-			continue
-		}
-		if req.isCancelled() {
-			continue
-		}
-		pq.admitSessionBoost(req)
-	}
-}
-
-// NotifyBackendMetricsRefreshed wakes the backpressure dequeue loop after the
-// store refreshes backend pod metrics. The capacity check reads cached metrics
-// that only change on the store's scrape cycle, so this signal lets a held queue
-// re-check exactly when fresh capacity data is available. It is a non-blocking,
-// coalescing send and a no-op for queues not in session-boost mode.
-func (pq *RequestPriorityQueue) NotifyBackendMetricsRefreshed() {
-	if pq.metricsRefreshCh == nil {
-		return
-	}
-	select {
-	case pq.metricsRefreshCh <- struct{}{}:
-	default: // A refresh signal is already pending.
-	}
-}
-
-// runBackpressureMode dequeues requests only when backend pods have capacity.
-// Uses two-level admission control:
+// runSessionBoostMode is the session-boost dequeue loop. It dequeues requests only
+// when backend pods have capacity, using two-level admission control:
 //  1. Inflight limit: at most InflightPerPod requests in flight per backend pod.
 //  2. Backend metrics check: at least one pod reports capacity available.
 //
-// The loop is fully event-driven: it reacts to releases, new arrivals, and the
-// store's metrics-refresh signal. There is no independent timer because the
-// capacity check only reads cached pod metrics, which change solely on the
-// store's scrape cycle.
+// The loop is fully event-driven: it reacts to releases and new arrivals. There
+// is no metrics-refresh signal or independent timer: in single-router operation
+// every moment backend capacity frees up coincides with one of our own requests
+// completing (a release), so releases and arrivals alone cover every dequeue
+// opportunity.
 //
 // Session Grace Period: when SessionBoostGracePeriod > 0, a release briefly holds
 // the freed slot (via waitGraceAndDequeue) so a same-session follow-up has time to
@@ -213,7 +172,7 @@ func (pq *RequestPriorityQueue) NotifyBackendMetricsRefreshed() {
 // immediately, so enabling grace adds no latency to first turns on an idle queue.
 // When a release and an arrival are pending at once, the release wins so the
 // just-freed slot is the one held for the grace window.
-func (pq *RequestPriorityQueue) runBackpressureMode(ctx context.Context) {
+func (pq *RequestPriorityQueue) runSessionBoostMode(ctx context.Context) {
 	grace := pq.config.SessionBoostGracePeriod > 0
 	klog.V(4).Infof("[SessionBoost] starting backpressure dequeue loop, gracePeriod=%v", pq.config.SessionBoostGracePeriod)
 	for {
@@ -243,10 +202,6 @@ func (pq *RequestPriorityQueue) runBackpressureMode(ctx context.Context) {
 			} else {
 				pq.tryBackpressureDequeue(ctx)
 			}
-		// Backend pod metrics were just refreshed by the store. Re-check capacity in
-		// case requests are being held because all backends previously read busy.
-		case <-pq.metricsRefreshCh:
-			pq.tryBackpressureDequeue(ctx)
 		}
 	}
 }

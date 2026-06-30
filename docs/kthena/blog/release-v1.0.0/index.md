@@ -8,7 +8,7 @@ date: 2026-06-30
 
 ## Summary
 
-We are excited to announce **Kthena v1.0.0**, a major milestone for Kubernetes-native LLM inference. This release focuses on production readiness across the serving stack: more accurate Gateway API routing, first-class role-level autoscaling for prefill/decode disaggregated workloads, better router scheduling signals, richer observability, improved GPU workload controls, and a more complete CLI experience.
+We are excited to announce **Kthena v1.0.0**, a major milestone for Kubernetes-native LLM inference. This release focuses on production readiness across the serving stack: more accurate Gateway API routing, first-class role-level autoscaling for prefill/decode disaggregated workloads, safer role-level rolling updates, better router scheduling signals, session boost for multi-turn conversation workloads, richer cache-aware router observability with Prometheus metrics and example dashboards, and a more complete CLI experience.
 
 Kthena v1.0.0 also includes an important autoscaling API consolidation. `AutoscalingPolicyBinding` has been removed, and target configuration now lives directly in `AutoscalingPolicy` through `homogeneousTarget`, `heterogeneousTarget`, and `disaggregatedTarget`.
 
@@ -18,34 +18,18 @@ Kthena v1.0.0 also includes an important autoscaling API consolidation. `Autosca
 
 ### Key Features Overview
 
-- **Gateway API and HTTPRoute correctness:** Kthena-router now honors HTTPRoute hostnames, keeps matched route rules consistent for backend selection and URL rewrites, fixes `PathPrefix` semantics, and respects Gateway listener `allowedRoutes`.
-- **Single-resource autoscaling API:** `AutoscalingPolicyBinding` is removed, and autoscaling target configuration is consolidated into `AutoscalingPolicy` through `homogeneousTarget`, `heterogeneousTarget`, and `disaggregatedTarget`.
-- **P/D disaggregated autoscaling:** `disaggregatedTarget` enables role-level autoscaling for prefill/decode workloads, including per-role metrics, per-role metric sources, replica bounds, fixed roles, and optional ratio constraints.
-- **Role-level rolling update availability control:** Enhancements to `RoleRollingUpdate` feature. Now Per-role can set `maxUnavailable`, to control the pace of the upgrade.
+- **AutoscalingPolicy consolidation and P/D coordinated disaggregated autoscaling:** `AutoscalingPolicyBinding` is removed, and autoscaling target configuration is consolidated into `AutoscalingPolicy`; `disaggregatedTarget` enables coordinated role-level autoscaling for prefill/decode workloads, allowing each role to scale from its own metrics while keeping P/D replica ratios within healthy bounds through optional ratio constraints.
+- **Session boost for multi-turn conversations:** The router can prioritize follow-up requests from recently completed sessions, improving the chance of reusing warm KV cache under concurrent agentic and chat workloads.
 - **Router scheduling and observability:** Per-pod in-flight request tracking, Redis-backed cross-router synchronization, configurable pod metrics scraping, and cache-aware Prometheus metrics improve scheduling accuracy and operational visibility.
-- **Session boost for multi-turn conversations:** The router can prioritize follow-up requests from recently completed sessions, improving the chance of reusing warm prefix/KV cache under concurrent agentic and chat workloads.
-- **ModelBooster GPU and offline support:** `runtimeClassName`, `ModelWorker.tolerations`, worker affinity propagation, and `KTHENA_SKIP_ENGINE_DEPENDENCY_INSTALL` make GPU and offline deployments easier to operate.
+- **Role-level rolling update availability control:** Enhancements to `RoleRollingUpdate` feature. Now Per-role can set `maxUnavailable`, to control the pace of the upgrade.
+- **Gateway API and HTTPRoute correctness:** Kthena router now honors HTTPRoute hostnames, keeps matched route rules consistent for backend selection and URL rewrites, fixes `PathPrefix` semantics, and respects Gateway listener `allowedRoutes`.
 - **CLI and OpenAI-compatible API improvements:** The CLI now exposes richer status output and supports `ModelRoute` and `ModelServer`, while the router adds an OpenAI-compatible `GET /v1/models` endpoint.
 
-### Gateway API and HTTPRoute Correctness
-
-Kthena-router now handles Gateway API traffic with stronger correctness guarantees. The router honors `HTTPRoute.spec.hostnames`, keeps the matched HTTPRoute rule associated with backend selection and URL rewrite filters, and chooses more specific path rules within a route. This avoids accidentally routing a request through a backend or filter from a different rule than the one that matched the request.
-
-This release also fixes Gateway API `PathPrefix` matching semantics and makes the router respect Gateway listener `allowedRoutes` before accepting HTTPRoutes.
-
-Related changes:
-
-- PRs:
-  - [feat: honor HTTPRoute hostnames and matched rule selection #1174](https://github.com/volcano-sh/kthena/pull/1174)
-  - [Fix HTTPRoute PathPrefix matching #1119](https://github.com/volcano-sh/kthena/pull/1119)
-  - [fix(router): respect Gateway allowedRoutes #1263](https://github.com/volcano-sh/kthena/pull/1263)
-- Contributors: [@zhy76](https://github.com/zhy76), [@Monti-27](https://github.com/Monti-27), [@avinxshKD](https://github.com/avinxshKD)
-
-### AutoscalingPolicy Consolidation and P/D Disaggregated Autoscaling
+### AutoscalingPolicy Consolidation and P/D Coordinated Disaggregated Autoscaling
 
 Kthena v1.0.0 introduces a simpler and more powerful autoscaling API. Users now configure what to scale, how to collect metrics, and scaling boundaries in a single `AutoscalingPolicy` resource.
 
-The new `disaggregatedTarget` mode enables coordinated autoscaling for role-based ModelServing deployments, especially prefill/decode disaggregated inference. Each role can define its own replica range, metrics, and metric sources. Operators can also configure a `ratioConstraint` to keep the replica ratio between two roles within a healthy range.
+The new `disaggregatedTarget` mode is designed for **coordinated P/D autoscaling** in role-based ModelServing deployments, especially prefill/decode disaggregated inference. Prefill and decode roles can make scaling decisions from their own metrics, while the autoscaler applies shared constraints so the two sides grow and shrink together instead of drifting independently. Each role can define its own replica range, metrics, and metric sources, and operators can configure a `ratioConstraint` to keep the P/D replica ratio within a healthy range.
 
 Example `disaggregatedTarget` configuration:
 
@@ -53,31 +37,32 @@ Example `disaggregatedTarget` configuration:
 spec:
   disaggregatedTarget:
     targetRef:
+      apiVersion: workload.serving.volcano.sh/v1alpha1
       kind: ModelServing
-      name: podinfo-pd-ms
+      name: vllm-qwen-pd-ms
     roles:
       prefill:
         minReplicas: 1
         maxReplicas: 8
         metrics:
-        - name: prefill_rps
-          targetValue: "0.5"
+          - name: prefill_waiting_requests
+            targetValue: "1"
         metricSources:
-          prefill_rps:
+          prefill_waiting_requests:
             prometheus:
               serverURL: http://kube-prometheus-stack-prometheus.test.svc.cluster.local:9090
-              query: sum(rate(http_requests_total{namespace="autoscale-demo", service="podinfo-prefill"}[2m]))
+              query: sum(vllm:num_requests_waiting{namespace="autoscale-demo", service="vllm-prefill"})
       decode:
         minReplicas: 1
         maxReplicas: 16
         metrics:
-        - name: decode_rps
-          targetValue: "0.5"
+          - name: decode_gpu_cache_usage
+            targetValue: "0.75"
         metricSources:
-          decode_rps:
+          decode_gpu_cache_usage:
             prometheus:
               serverURL: http://kube-prometheus-stack-prometheus.test.svc.cluster.local:9090
-              query: sum(rate(http_requests_total{namespace="autoscale-demo", service="podinfo-decode"}[2m]))
+              query: sum(vllm:gpu_cache_usage_perc{namespace="autoscale-demo", service="vllm-decode"})
     ratioConstraint:
       numeratorRole: prefill
       denominatorRole: decode
@@ -93,6 +78,55 @@ Related changes:
   - [merge autoscalingpolicybinding to autoscalingpolicy #1203](https://github.com/volcano-sh/kthena/pull/1203)
   - [Implementation of PD disaggregation auto-scaler #1258](https://github.com/volcano-sh/kthena/pull/1258)
 - Contributors: [@LiZhenCheng9527](https://github.com/LiZhenCheng9527)
+
+### Session Boost for Multi-Turn Conversation Workloads
+
+Kthena v1.0.0 adds session boost support to improve multi-round chat, agentic workflows, and RAG chains where each request depends on previous responses. In these workloads, follow-up requests often reuse a large shared prefix. If they wait behind unrelated traffic for too long, corresponding backend KV cache entries may be evicted and time-to-first-token can increase.
+
+Session boost lets the router track recently completed sessions and prioritize follow-up requests from those sessions in the waiting queue. The implementation keeps this behavior separate from user-fairness scheduling and uses dedicated session-boost configuration, including session header selection, bounded recent-session tracking, inflight admission limits, and an optional grace period for advanced cache-hit optimization.
+
+The feature is designed to improve cache reuse opportunities under concurrent multi-turn traffic without claiming pod affinity by itself. For the strongest KV cache benefit, operators should also ensure that session-aware or cache-aware routing can place follow-up requests on backends that still hold the warm cache.
+
+Example Helm configuration:
+
+```yaml
+networking:
+  kthenaRouter:
+    sessionBoost:
+      enabled: true
+      header: X-Session-ID
+      maxSessions: 4096
+      inflightPerPod: 16
+      gracePeriod: 0s
+```
+
+Related changes:
+
+- Issue: [Improve multi-round conversation case #1190](https://github.com/volcano-sh/kthena/issues/1190)
+- PRs:
+  - [session boost queue to optimize multi conversation scenario #1183](https://github.com/volcano-sh/kthena/pull/1183)
+- Contributors: [@YaoZengzeng](https://github.com/YaoZengzeng), [@hzxuzhonghu](https://github.com/hzxuzhonghu), [@FAUST-BENCHOU](https://github.com/FAUST-BENCHOU), [@LiZhenCheng9527](https://github.com/LiZhenCheng9527)
+
+### Smarter Router Scheduling and Cache-Aware Observability
+
+The router now has better load signals for scheduling decisions. Kthena tracks per-pod in-flight requests and can synchronize these counters across router replicas through Redis, allowing the `least-request` plugin to make decisions based on real-time load instead of only local router state.
+
+Cache-aware scheduling is also much more observable. The `prefix-cache` and `kvcache-aware` score plugins now export Prometheus metrics on the router's existing `/metrics` endpoint, replacing klog-only visibility with queryable, model-labelled time series for load testing and production tuning.
+
+For cache effectiveness, Kthena records match-ratio histograms instead of simple hit/miss counters. `kthena_router_prefix_cache_match_ratio` and `kthena_router_kvcache_aware_match_ratio` report the fraction of a prompt's blocks already available on the best-matching candidate pod, with `0` representing a real miss. This makes hit rate derivable from the `le="0.0"` bucket while also showing how much of the prefix was reused.
+
+Related changes:
+
+- Proposal:
+  - [Observability for prefix-cache and kvcache-aware Score Plugins](https://github.com/volcano-sh/kthena/blob/main/docs/proposal/cache-observability.md)
+- PRs:
+  - [feat(router): add per-pod on-flight request tracking with Redis sync #962](https://github.com/volcano-sh/kthena/pull/962)
+  - [Add SGLang tokenizer support for KV-cache-aware scheduling #997](https://github.com/volcano-sh/kthena/pull/997)
+  - [router: add observability metrics for prefix-cache and kvcache-aware score plugins #1194](https://github.com/volcano-sh/kthena/pull/1194)
+  - [feat(router): make pod metrics update interval configurable #1151](https://github.com/volcano-sh/kthena/pull/1151)
+  - [perf(router): cache parsed prompt to avoid redundant ParsePrompt call #1123](https://github.com/volcano-sh/kthena/pull/1123)
+  - [fix: parallelize pod metrics scraping loop with bounded concurrency #1255](https://github.com/volcano-sh/kthena/pull/1255)
+- Contributors: [@hzxuzhonghu](https://github.com/hzxuzhonghu), [@blenbot](https://github.com/blenbot), [@kube-gopher](https://github.com/kube-gopher), [@rajnish-jais](https://github.com/rajnish-jais), [@nabrahma](https://github.com/nabrahma)
 
 ### Role RollingUpdate Availability Control
 
@@ -125,66 +159,19 @@ Related changes:
   - [Role rollingupdate support maxUnavailable settings #1239](https://github.com/volcano-sh/kthena/pull/1239)
 - Contributors: [@hzxuzhonghu](https://github.com/hzxuzhonghu), [@LiZhenCheng9527](https://github.com/LiZhenCheng9527)
 
-### Smarter Router Scheduling and Cache-Aware Observability
+### Gateway API and HTTPRoute Correctness
 
-The router now has better load signals for scheduling decisions. Kthena tracks per-pod in-flight requests and can synchronize these counters across router replicas through Redis, allowing the `least-request` plugin to make decisions based on real-time load instead of only local router state.
+Kthena-router now handles Gateway API traffic with stronger correctness guarantees. The router honors `HTTPRoute.spec.hostnames`, keeps the matched HTTPRoute rule associated with backend selection and URL rewrite filters, and chooses more specific path rules within a route. This avoids accidentally routing a request through a backend or filter from a different rule than the one that matched the request.
 
-Cache-aware scheduling is also more observable. The `prefix-cache` and `kvcache-aware` score plugins now export Prometheus metrics on the router's existing `/metrics` endpoint. These metrics expose cache match quality, Redis and tokenizer latency, error counts, cache occupancy, and eviction pressure.
-
-Related changes:
-
-- PRs:
-  - [feat(router): add per-pod on-flight request tracking with Redis sync #962](https://github.com/volcano-sh/kthena/pull/962)
-  - [Add SGLang tokenizer support for KV-cache-aware scheduling #997](https://github.com/volcano-sh/kthena/pull/997)
-  - [router: add observability metrics for prefix-cache and kvcache-aware score plugins #1194](https://github.com/volcano-sh/kthena/pull/1194)
-  - [feat(router): make pod metrics update interval configurable #1151](https://github.com/volcano-sh/kthena/pull/1151)
-  - [perf(router): cache parsed prompt to avoid redundant ParsePrompt call #1123](https://github.com/volcano-sh/kthena/pull/1123)
-  - [fix: parallelize pod metrics scraping loop with bounded concurrency #1255](https://github.com/volcano-sh/kthena/pull/1255)
-- Contributors: [@hzxuzhonghu](https://github.com/hzxuzhonghu), [@blenbot](https://github.com/blenbot), [@kube-gopher](https://github.com/kube-gopher), [@rajnish-jais](https://github.com/rajnish-jais), [@nabrahma](https://github.com/nabrahma)
-
-### Session Boost for Multi-Turn Conversation Workloads
-
-Kthena v1.0.0 adds session boost support to improve multi-round chat, agentic workflows, and RAG chains where each request depends on previous responses. In these workloads, follow-up requests often reuse a large shared prefix. If they wait behind unrelated traffic for too long, backend prefix/KV cache entries may be evicted and time-to-first-token can increase.
-
-Session boost lets the router track recently completed sessions and prioritize follow-up requests from those sessions in the waiting queue. The implementation keeps this behavior separate from user-fairness scheduling and uses dedicated session-boost configuration, including session header selection, bounded recent-session tracking, inflight admission limits, and an optional grace period for advanced cache-hit optimization.
-
-The feature is designed to improve cache reuse opportunities under concurrent multi-turn traffic without claiming pod affinity by itself. For the strongest prefix/KV cache benefit, operators should also ensure that session-aware or cache-aware routing can place follow-up requests on backends that still hold the warm cache.
-
-Example Helm configuration:
-
-```yaml
-networking:
-  kthenaRouter:
-    sessionBoost:
-      enabled: true
-      header: X-Session-ID
-      maxSessions: 4096
-      inflightPerPod: 16
-      gracePeriod: 0s
-```
-
-Related changes:
-
-- Issue: [Improve multi-round conversation case #1190](https://github.com/volcano-sh/kthena/issues/1190)
-- PRs:
-  - [session boost queue to optimize multi conversation scenario #1183](https://github.com/volcano-sh/kthena/pull/1183)
-- Contributors: [@YaoZengzeng](https://github.com/YaoZengzeng), [@hzxuzhonghu](https://github.com/hzxuzhonghu), [@FAUST-BENCHOU](https://github.com/FAUST-BENCHOU), [@LiZhenCheng9527](https://github.com/LiZhenCheng9527)
-
-### Better ModelBooster Support for GPU and Offline Environments
-
-ModelBooster now works better on production GPU clusters and private environments. This release adds `runtimeClassName` support for GPU workloads, `tolerations` support on `ModelWorker`, and propagation of worker affinity into generated pod templates.
-
-For offline clusters and prebuilt engine images, operators can set `KTHENA_SKIP_ENGINE_DEPENDENCY_INSTALL=true` to skip startup-time connector dependency installation while preserving the default behavior for existing base images.
+This release also fixes Gateway API `PathPrefix` matching semantics and makes the router respect Gateway listener `allowedRoutes` before accepting HTTPRoutes.
 
 Related changes:
 
 - PRs:
-  - [feat: add runtimeClassName support for ModelBooster GPU workloads #972](https://github.com/volcano-sh/kthena/pull/972)
-  - [feat: add tolerations fields to ModelWorker #1141](https://github.com/volcano-sh/kthena/pull/1141)
-  - [fix(model-booster): wire ModelWorker.Affinity to pod spec templates #1146](https://github.com/volcano-sh/kthena/pull/1146)
-  - [Support offline ModelBooster engine images #945](https://github.com/volcano-sh/kthena/pull/945)
-  - [fix(examples): correct cacheURI and HF endpoint #1246](https://github.com/volcano-sh/kthena/pull/1246)
-- Contributors: [@xrwang8](https://github.com/xrwang8), [@Abirdcfly](https://github.com/Abirdcfly), [@Alivestars04](https://github.com/Alivestars04)
+  - [feat: honor HTTPRoute hostnames and matched rule selection #1174](https://github.com/volcano-sh/kthena/pull/1174)
+  - [Fix HTTPRoute PathPrefix matching #1119](https://github.com/volcano-sh/kthena/pull/1119)
+  - [fix(router): respect Gateway allowedRoutes #1263](https://github.com/volcano-sh/kthena/pull/1263)
+- Contributors: [@zhy76](https://github.com/zhy76), [@Monti-27](https://github.com/Monti-27), [@avinxshKD](https://github.com/avinxshKD)
 
 ### CLI and OpenAI-Compatible API Improvements
 
@@ -200,7 +187,7 @@ The router also adds an OpenAI-compatible `GET /v1/models` endpoint, returning a
 Related changes:
 
 - PRs:
-  - [feat: add STATUS and READY coloums to kthena get output #978](https://github.com/volcano-sh/kthena/pull/978)
+  - [feat: add STATUS and READY columns to kthena get output #978](https://github.com/volcano-sh/kthena/pull/978)
   - [feat: add CLI support for ModelRoute and ModelServer resources #981](https://github.com/volcano-sh/kthena/pull/981)
   - [feat: support /v1/models endpoint #996](https://github.com/volcano-sh/kthena/pull/996)
 - Contributors: [@anirudh240](https://github.com/anirudh240), [@madmecodes](https://github.com/madmecodes)
@@ -212,6 +199,7 @@ Related changes:
 - Added SGLang Dynamo mocker coverage and SGLang inference simulator integration. [#920](https://github.com/volcano-sh/kthena/pull/920), [#1231](https://github.com/volcano-sh/kthena/pull/1231)
 - Added router `pprof` endpoint support. [#1057](https://github.com/volcano-sh/kthena/pull/1057)
 - Added `debugPort` Helm chart support for controller-manager. [#1032](https://github.com/volcano-sh/kthena/pull/1032)
+- Improved ModelBooster GPU and offline environment support. [#972](https://github.com/volcano-sh/kthena/pull/972), [#1141](https://github.com/volcano-sh/kthena/pull/1141), [#1146](https://github.com/volcano-sh/kthena/pull/1146), [#945](https://github.com/volcano-sh/kthena/pull/945)
 - Added GPU usage plugin E2E coverage. [#1199](https://github.com/volcano-sh/kthena/pull/1199)
 - Refreshed the quick-start documentation and recommends starting with ModelServing. [#1260](https://github.com/volcano-sh/kthena/pull/1260)
 - Added DeepSeek-v4 model-serving examples. [#936](https://github.com/volcano-sh/kthena/pull/936), [#937](https://github.com/volcano-sh/kthena/pull/937)
@@ -284,22 +272,6 @@ Users should migrate autoscaling target configuration into one of the following 
 - `homogeneousTarget`
 - `heterogeneousTarget`
 - `disaggregatedTarget`
-
-### New AutoscalingPolicy Fields
-
-The new `disaggregatedTarget` API includes:
-
-- `spec.disaggregatedTarget.targetRef`
-- `spec.disaggregatedTarget.roles`
-- `spec.disaggregatedTarget.roles[*].minReplicas`
-- `spec.disaggregatedTarget.roles[*].maxReplicas`
-- `spec.disaggregatedTarget.roles[*].metrics`
-- `spec.disaggregatedTarget.roles[*].metricSources`
-- `spec.disaggregatedTarget.ratioConstraint`
-- `spec.disaggregatedTarget.ratioConstraint.numeratorRole`
-- `spec.disaggregatedTarget.ratioConstraint.denominatorRole`
-- `spec.disaggregatedTarget.ratioConstraint.minRatio`
-- `spec.disaggregatedTarget.ratioConstraint.maxRatio`
 
 For further details, please refer to the [CRD documentation](https://kthena.volcano.sh/docs/next/reference/crd/workload.serving.volcano.sh) and the [Proposal](https://github.com/volcano-sh/kthena/pull/1172).
 
@@ -428,6 +400,6 @@ kubectl get modelservers.networking.serving.volcano.sh --all-namespaces
 
 Thank you to everyone who contributed to Kthena v1.0.0 across controllers, router, autoscaler, CLI, Helm charts, examples, docs, CI, generated clients, and tests.
 
-Special thanks to contributors including [@Abirdcfly](https://github.com/Abirdcfly), [@Alivestars04](https://github.com/Alivestars04), [@anirudh240](https://github.com/anirudh240), [@avinxshKD](https://github.com/avinxshKD), [@blenbot](https://github.com/blenbot), [@FAUST-BENCHOU](https://github.com/FAUST-BENCHOU), [@hzxuzhonghu](https://github.com/hzxuzhonghu), [@JagjeevanAK](https://github.com/JagjeevanAK), [@katara-Jayprakash](https://github.com/katara-Jayprakash), [@kube-gopher](https://github.com/kube-gopher), [@LiZhenCheng9527](https://github.com/LiZhenCheng9527), [@madmecodes](https://github.com/madmecodes), [@nabrahma](https://github.com/nabrahma), [@nXtCyberNet](https://github.com/nXtCyberNet), [@rajnish-jais](https://github.com/rajnish-jais), [@Sanchit2662](https://github.com/Sanchit2662), [@verma-garv](https://github.com/verma-garv), [@WHOIM1205](https://github.com/WHOIM1205), [@xrwang8](https://github.com/xrwang8), and [@zhy76](https://github.com/zhy76).
+Special thanks to contributors including [@Abirdcfly](https://github.com/Abirdcfly), [@Alivestars04](https://github.com/Alivestars04), [@anirudh240](https://github.com/anirudh240), [@avinxshKD](https://github.com/avinxshKD), [@blenbot](https://github.com/blenbot), [@FAUST-BENCHOU](https://github.com/FAUST-BENCHOU), [@hzxuzhonghu](https://github.com/hzxuzhonghu), [@JagjeevanAK](https://github.com/JagjeevanAK), [@katara-Jayprakash](https://github.com/katara-Jayprakash), [@kube-gopher](https://github.com/kube-gopher), [@LiZhenCheng9527](https://github.com/LiZhenCheng9527), [@madmecodes](https://github.com/madmecodes), [@nabrahma](https://github.com/nabrahma), [@nXtCyberNet](https://github.com/nXtCyberNet), [@rajnish-jais](https://github.com/rajnish-jais), [@Sanchit2662](https://github.com/Sanchit2662), [@verma-garv](https://github.com/verma-garv), [@WHOIM1205](https://github.com/WHOIM1205), [@xrwang8](https://github.com/xrwang8), and [@zhy76](https://github.com/zhy76),[@YaoZengzeng](https://github.com/YaoZengzeng).
 
 We warmly invite developers, operators, and AI infrastructure teams to try Kthena v1.0.0 and help shape the next generation of cloud native LLM serving.

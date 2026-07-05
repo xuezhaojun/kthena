@@ -54,11 +54,11 @@ type ModelBackend struct {
 	Type ModelBackendType `json:"type"`
 	// ModelURI is the source from which the model is fetched by the downloader init container.
 	// Supported schemes:
-	//   hf://<namespace>/<repo>         — Hugging Face Hub repository
-	//   ms://<namespace>/<repo>         — ModelScope repository
-	//   s3://<bucket>/<path>            — S3-compatible object storage
-	//   obs://<bucket>/<path>           — Huawei Object Storage Service (OBS)
-	//   pvc:///<claimName>/<path>       — path inside a PVC already mounted via CacheURI
+	//   hf://NAMESPACE/REPO         — Hugging Face Hub repository
+	//   ms://NAMESPACE/REPO         — ModelScope repository
+	//   s3://BUCKET/PATH            — S3-compatible object storage
+	//   obs://BUCKET/PATH           — Huawei Object Storage Service (OBS)
+	//   pvc:///CLAIM_NAME/PATH      — path inside a PVC already mounted via CacheURI
 	//
 	// When using pvc://, the downloader reads the given path from the container filesystem.
 	// The downloader init container only mounts the volume specified by CacheURI, so the
@@ -70,9 +70,9 @@ type ModelBackend struct {
 	// CacheURI specifies where the downloaded model is stored and how the storage volume is
 	// mounted inside every pod (both the downloader init container and the inference engine).
 	// Supported schemes:
-	//   pvc://<claimName>    — PersistentVolumeClaim; the PVC is mounted at /<claimName>
-	//   hostpath://<path>    — host-local directory; mounted at /<path>
-	//   (empty)              — an ephemeral EmptyDir volume is used (no persistence)
+	//   pvc://CLAIM_NAME    — PersistentVolumeClaim; the PVC is mounted at /CLAIM_NAME
+	//   hostpath://PATH     — host-local directory; mounted at /PATH
+	//   (empty)             — an ephemeral EmptyDir volume is used (no persistence)
 	//
 	// The downloader writes model files under a hashed sub-directory of this mount path.
 	// The inference engine reads from the same path.  When ModelURI uses pvc://, CacheURI

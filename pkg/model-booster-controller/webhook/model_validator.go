@@ -19,6 +19,7 @@ package webhook
 import (
 	"fmt"
 	"net/http"
+	"path"
 	"strings"
 
 	registryv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/workload/v1alpha1"
@@ -216,7 +217,15 @@ func validatePVCURICompatibility(model *registryv1alpha1.ModelBooster) field.Err
 	// Verify the source path is reachable through the cache volume mount point.
 	sourcePath := pvcModelSourcePath(backend.ModelURI)
 	mountPath := cacheVolumeMountPath(backend.CacheURI)
-	if mountPath != "" && sourcePath != mountPath && !strings.HasPrefix(sourcePath, mountPath+"/") {
+	if mountPath == "" {
+		allErrs = append(allErrs, field.Invalid(
+			backendPath.Child("cacheURI"),
+			backend.CacheURI,
+			"cacheURI must specify a valid PVC claim name (e.g. pvc://<claimName>)",
+		))
+		return allErrs
+	}
+	if sourcePath != mountPath && !strings.HasPrefix(sourcePath, mountPath+"/") {
 		allErrs = append(allErrs, field.Invalid(
 			backendPath.Child("modelURI"),
 			backend.ModelURI,
@@ -234,20 +243,23 @@ func validatePVCURICompatibility(model *registryv1alpha1.ModelBooster) field.Err
 	return allErrs
 }
 
-// pvcModelSourcePath returns the absolute filesystem path that the PVC downloader will
-// attempt to read.  It mirrors the logic of PVCDownloader._parse_pvc_path() in
-// python/kthena/downloader/pvc.py: strip the pvc:// prefix and ensure a leading slash.
+// pvcModelSourcePath returns the cleaned absolute filesystem path that the PVC downloader
+// will attempt to read.  It mirrors the logic of PVCDownloader._parse_pvc_path() in
+// python/kthena/downloader/pvc.py: strip the pvc:// prefix, ensure a leading slash, and
+// normalize with path.Clean to collapse ".." and repeated slashes so that path-traversal
+// sequences cannot bypass the reachability check.
 func pvcModelSourcePath(modelURI string) string {
-	path := strings.TrimPrefix(modelURI, "pvc://")
-	if !strings.HasPrefix(path, "/") {
-		path = "/" + path
+	p := strings.TrimPrefix(modelURI, "pvc://")
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
 	}
-	return path
+	return path.Clean(p)
 }
 
-// cacheVolumeMountPath returns the absolute in-container path at which the cache volume
-// is mounted.  It mirrors the logic of convert.GetCachePath: take the part after ://,
-// trim surrounding slashes, and prepend /.
+// cacheVolumeMountPath returns the cleaned absolute in-container path at which the cache
+// volume is mounted.  It mirrors the logic of convert.GetCachePath: take the part after
+// ://, trim surrounding slashes, and prepend /.  path.Clean is applied so that the result
+// is always a canonical path, matching the normalization done in pvcModelSourcePath.
 func cacheVolumeMountPath(cacheURI string) string {
 	const sep = "://"
 	idx := strings.Index(cacheURI, sep)
@@ -258,7 +270,7 @@ func cacheVolumeMountPath(cacheURI string) string {
 	if s == "" {
 		return ""
 	}
-	return "/" + s
+	return path.Clean("/" + s)
 }
 
 // validateImageField checks if a container image string is a valid Docker reference.

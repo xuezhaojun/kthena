@@ -214,7 +214,22 @@ func validatePVCURICompatibility(model *registryv1alpha1.ModelBooster) field.Err
 		return allErrs
 	}
 
+	// Explicitly reject ".." segments in the raw modelURI before any normalization.
+	// path.Clean (applied inside pvcModelSourcePath) would resolve them silently, but a URI
+	// containing ".." is almost certainly a misconfiguration and should be rejected clearly.
+	rawPVCPath := strings.TrimPrefix(backend.ModelURI, "pvc://")
+	if strings.Contains(rawPVCPath, "/../") || strings.HasSuffix(rawPVCPath, "/..") || rawPVCPath == ".." {
+		allErrs = append(allErrs, field.Invalid(
+			backendPath.Child("modelURI"),
+			backend.ModelURI,
+			"pvc:// modelURI must not contain '..' path segments",
+		))
+		return allErrs
+	}
+
 	// Verify the source path is reachable through the cache volume mount point.
+	// pvcModelSourcePath applies path.Clean so the normalized paths are canonical
+	// before the prefix check.
 	sourcePath := pvcModelSourcePath(backend.ModelURI)
 	mountPath := cacheVolumeMountPath(backend.CacheURI)
 	if mountPath == "" {

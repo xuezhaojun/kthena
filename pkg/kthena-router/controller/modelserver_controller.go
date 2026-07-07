@@ -216,43 +216,29 @@ func (c *ModelServerController) syncModelServerHandler(key string) error {
 
 	_ = c.store.AddOrUpdateModelServer(ms, pods)
 
-	// Get already bound pods to avoid unnecessary updates
-	existingPods, err := c.store.GetPodsByModelServer(utils.GetNamespaceName(ms))
-	if err != nil {
-		klog.V(4).Infof("failed to get existing pods for ModelServer %s/%s: %v", ms.Namespace, ms.Name, err)
-	}
-
-	// Build a set of existing pod names that are already bound to the model server
-	existingPodNames := sets.New[types.NamespacedName]()
-	for _, podInfo := range existingPods {
-		pod := podInfo.GetPod()
-		if pod == nil {
-			continue
-		}
-		if !podInfo.HasModelServer(utils.GetNamespaceName(ms)) {
-			// If the pod is not bound to the model server, establish the binding
-			if err := c.store.AppendModelServerToPod(pod, []*aiv1alpha1.ModelServer{ms}); err != nil {
-				klog.Warningf("failed to append modelserver %s/%s to pod %s/%s: %v", ms.Namespace, ms.Name, pod.Namespace, pod.Name, err)
-				continue
-			}
-		}
-		existingPodNames.Insert(utils.GetNamespaceName(pod))
-	}
-
-	// Add new pods that are not yet bound to the store
+	// Bind every ready pod selected by this ModelServer. Pods that already have
+	// an entry in the store get the binding appended so their runtime metrics and
+	// bindings to other ModelServers are preserved; brand-new pods are created
+	// with the binding. We check each pod against the store directly instead of
+	// re-reading GetPodsByModelServer, which would only echo back the pod set that
+	// AddOrUpdateModelServer just wrote and cannot distinguish existing pods from
+	// new ones.
+	msName := utils.GetNamespaceName(ms)
 	for _, pod := range podList {
 		if !isPodReady(pod) {
 			continue
 		}
 
 		podName := utils.GetNamespaceName(pod)
-		// Skip pods that are already properly bound
-		if existingPodNames.Contains(podName) {
+		if c.store.GetPodInfo(podName) != nil {
+			if err := c.store.AppendModelServerToPod(pod, []*aiv1alpha1.ModelServer{ms}); err != nil {
+				klog.Warningf("failed to append modelserver %s to pod %s: %v", msName, podName, err)
+			}
 			continue
 		}
 
 		if err := c.store.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms}); err != nil {
-			klog.Warningf("failed to add new pod %s/%s to data store: %v", pod.Namespace, pod.Name, err)
+			klog.Warningf("failed to add new pod %s to data store: %v", podName, err)
 		}
 	}
 

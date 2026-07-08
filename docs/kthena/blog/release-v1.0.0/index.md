@@ -130,7 +130,7 @@ Related changes:
 
 ### Role RollingUpdate Availability Control
 
-Kthena v0.4.0 introduced `RoleRollingUpdate`, but role updates could still delete all outdated Role replicas in a ServingGroup at once. When `servingGroup.replicas` was `1`, this could make the service temporarily unavailable during a role-level rollout.
+Kthena v0.4.0 introduced `RoleRollingUpdate`, but role updates could still delete all outdated Role replicas in a ServingGroup at once. When `spec.replicas` was `1`, this could make the service temporarily unavailable during a role-level rollout.
 
 Kthena v1.0.0 adds per-Role `maxUnavailable` support for `RoleRollingUpdate`. Operators can now control the step size of each Role update independently, using either an absolute number or a percentage. This gives role-level rolling updates the same availability-oriented control that ServingGroup-level updates already had, while keeping Role-level and ServingGroup-level rollout budgets separate.
 
@@ -280,7 +280,7 @@ For further details, please refer to the [CRD documentation](https://kthena.volc
 - `ModelBackend.runtimeClassName` configures the Kubernetes RuntimeClass used by generated backend pods.
 - `ModelWorker.tolerations` configures worker pod tolerations.
 - `KTHENA_SKIP_ENGINE_DEPENDENCY_INSTALL=true` skips startup-time connector dependency installation for offline or prebuilt engine images.
-- `METRICS_UPDATE_INTERVAL` controls the router pod metrics scrape interval.
+- `METRICS_SCRAPE_INTERVAL` controls the router pod metrics scrape interval.
 - Controller-manager Helm values now support `debugPort`.
 
 ### Build Environment
@@ -393,7 +393,7 @@ kubectl get modelservers.networking.serving.volcano.sh --all-namespaces
 - `disaggregatedTarget` supports role-level autoscaling and optional role ratio constraints. Fixed roles can use `minReplicas == maxReplicas`.
 - Existing ModelBooster behavior remains backward compatible by default. Set `KTHENA_SKIP_ENGINE_DEPENDENCY_INSTALL=true` only when using offline or prebuilt engine images that already include connector dependencies.
 - GPU clusters that require custom runtimes can set `ModelBackend.runtimeClassName`; tainted GPU nodes can be targeted with `ModelWorker.tolerations`.
-- Router pod metrics scraping can be tuned with `METRICS_UPDATE_INTERVAL`. Keep the default unless you need fresher scheduling signals or lower scrape overhead.
+- Router pod metrics scraping can be tuned with `METRICS_SCRAPE_INTERVAL`. Keep the default unless you need fresher scheduling signals or lower scrape overhead.
 - Development and build prerequisites now use Go `1.26.4`; this affects contributors and image builders, not normal Helm or manifest-based runtime upgrades.
 
 ## Thank You, Contributors

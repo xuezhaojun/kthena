@@ -686,7 +686,7 @@ func (c *ModelServingController) syncServingGroupReplicas(ctx context.Context, m
 // When partition is set, it fills missing ordinals in [0, partition) using CurrentRevision.
 // Otherwise, it creates new ServingGroups with increasing indices starting from the current max index + 1.
 func (c *ModelServingController) scaleUpServingGroups(ctx context.Context, ms *workloadv1alpha1.ModelServing, servingGroupList []datastore.ServingGroup, expectedCount int, newRevision string) error {
-	partition := c.getPartition(ms)
+	partition, _, _ := c.getPartition(modelServingRolloutConfig(ms), modelServingReplicas(ms))
 	klog.V(4).Infof("scaleUpServingGroups: start for modelServing=%s, existingGroups=%d, expectedCount=%d, partition=%d, newRevision=%s",
 		utils.GetNamespaceName(ms), len(servingGroupList), expectedCount, partition, newRevision)
 
@@ -820,7 +820,7 @@ func (c *ModelServingController) syncRoleReplicas(ctx context.Context, ms *workl
 	if err != nil && !errors.Is(err, datastore.ErrServingGroupNotFound) {
 		return fmt.Errorf("cannot get ServingGroup of modelServing: %s from map: %v", ms.GetName(), err)
 	}
-	partition := c.getPartition(ms)
+	partition, _, _ := c.getPartition(modelServingRolloutConfig(ms), modelServingReplicas(ms))
 	for index, servingGroup := range servingGroupList {
 		if c.store.GetServingGroupStatus(utils.GetNamespaceName(ms), servingGroup.Name) == datastore.ServingGroupDeleting {
 			// Deleting ServingGroup will be recreated after the deletion is complete, so there is no need to scale the roles
@@ -881,7 +881,7 @@ func (c *ModelServingController) scaleDownRoles(ctx context.Context, ms *workloa
 		return
 	}
 
-	partition, _, partitionErr := utils.GetPartitionForRole(targetRole)
+	partition, _, partitionErr := c.getPartition(targetRole.RollingUpdateConfiguration, roleReplicas(targetRole))
 	if partitionErr != nil {
 		klog.Errorf("scaleDownRoles: failed to parse partition for role %s: %v", targetRole.Name, partitionErr)
 		partition = 0
@@ -944,7 +944,7 @@ func (c *ModelServingController) scaleDownRoles(ctx context.Context, ms *workloa
 // When partition is set, it fills missing ordinals in [0, partition) using CurrentRevision.
 // Otherwise, it creates new Roles with increasing indices starting from the current max index + 1.
 func (c *ModelServingController) scaleUpRoles(ctx context.Context, ms *workloadv1alpha1.ModelServing, groupName string, targetRole workloadv1alpha1.Role, roleList []datastore.Role, expectedCount int, servingGroupOrdinal int, newRevision string) {
-	partition, partitionConfigured, partitionErr := utils.GetPartitionForRole(targetRole)
+	partition, partitionConfigured, partitionErr := c.getPartition(targetRole.RollingUpdateConfiguration, roleReplicas(targetRole))
 	if partitionErr != nil {
 		klog.Errorf("scaleUpRoles: failed to parse partition for role %s: %v", targetRole.Name, partitionErr)
 	}
@@ -1032,7 +1032,7 @@ func (c *ModelServingController) manageRoleReplicasPerGroup(ctx context.Context,
 
 	expectedCount := int(*targetRole.Replicas)
 	expectedPods := 1 + int(targetRole.WorkerReplicas)
-	partition, partitionConfigured, partitionErr := utils.GetPartitionForRole(targetRole)
+	partition, partitionConfigured, partitionErr := c.getPartition(targetRole.RollingUpdateConfiguration, roleReplicas(targetRole))
 	if partitionErr != nil {
 		klog.Errorf("manageRoleReplicasPerGroup: failed to parse partition for role %s: %v", targetRole.Name, partitionErr)
 	}
@@ -1247,7 +1247,7 @@ func (c *ModelServingController) manageRollingUpdate(ctx context.Context, ms *wo
 		return fmt.Errorf("cannot get ServingGroupList from store, err:%v", err)
 	}
 
-	partition := c.getPartition(ms)
+	partition, _, _ := c.getPartition(modelServingRolloutConfig(ms), modelServingReplicas(ms))
 	// Separate outdated groups into two categories: not-running and running
 	// We prioritize updating not-running outdated groups first
 	var notRunningOutdatedGroups []datastore.ServingGroup
@@ -1419,7 +1419,7 @@ func (c *ModelServingController) rolesToDeleteForRoleRollingUpdate(ms *workloadv
 		}
 
 		outdatedRoles, newUnavailable := c.outdatedRoles(ms, sg, roleSpec, roleList)
-		partition, partitionConfigured, partitionErr := utils.GetPartitionForRole(roleSpec)
+		partition, partitionConfigured, partitionErr := c.getPartition(roleSpec.RollingUpdateConfiguration, roleReplicas(roleSpec))
 		if partitionErr != nil {
 			return nil, false, fmt.Errorf("failed to parse partition for role %s: %v", roleSpec.Name, partitionErr)
 		}
@@ -2186,27 +2186,39 @@ func (c *ModelServingController) UpdateModelServingStatus(ms *workloadv1alpha1.M
 	})
 }
 
-// getPartition returns the partition value from ModelServing spec, or 0 if not set.
-// If the partition is specified as a percentage, it is calculated from the total replicas (rounded up).
-func (c *ModelServingController) getPartition(ms *workloadv1alpha1.ModelServing) int {
-	var config *workloadv1alpha1.RollingUpdateConfiguration
-	if ms.Spec.RolloutStrategy != nil {
-		config = ms.Spec.RolloutStrategy.RollingUpdateConfiguration
+// getPartition returns the partition value from RollingUpdateConfiguration.
+// Returns (0, false, nil) when partition is not configured.
+// If partition is a percentage, it is calculated from replicas (rounded up).
+func (c *ModelServingController) getPartition(config *workloadv1alpha1.RollingUpdateConfiguration, replicas int) (int, bool, error) {
+	if config == nil || config.Partition == nil {
+		return 0, false, nil
 	}
-	replicas := 0
-	if ms.Spec.Replicas != nil {
-		replicas = int(*ms.Spec.Replicas)
-	}
-	if config != nil && config.Partition != nil && config.Partition.Type != intstr.Int && ms.Spec.Replicas == nil {
-		klog.Warningf("ModelServing %s/%s has nil spec.replicas; defaulting partition to 0", ms.Namespace, ms.Name)
-		return 0
-	}
-	partition, _, err := utils.GetPartition(config, replicas)
+	partition, err := intstr.GetScaledValueFromIntOrPercent(config.Partition, replicas, true)
 	if err != nil {
-		klog.Errorf("ModelServing %s/%s has invalid partition %q; failed to get partition value: %v", ms.Namespace, ms.Name, config.Partition.String(), err)
+		return 0, true, err
+	}
+	return partition, true, nil
+}
+
+func modelServingRolloutConfig(ms *workloadv1alpha1.ModelServing) *workloadv1alpha1.RollingUpdateConfiguration {
+	if ms.Spec.RolloutStrategy == nil {
+		return nil
+	}
+	return ms.Spec.RolloutStrategy.RollingUpdateConfiguration
+}
+
+func modelServingReplicas(ms *workloadv1alpha1.ModelServing) int {
+	if ms.Spec.Replicas == nil {
 		return 0
 	}
-	return partition
+	return int(*ms.Spec.Replicas)
+}
+
+func roleReplicas(role workloadv1alpha1.Role) int {
+	if role.Replicas == nil {
+		return 1
+	}
+	return int(*role.Replicas)
 }
 
 // scaleDownServingGroups scales down the ServingGroups to the expected count with two-level priority-based selection:
@@ -2215,7 +2227,7 @@ func (c *ModelServingController) getPartition(ms *workloadv1alpha1.ModelServing)
 // When partition is set, the first N replicas (where N = partition) are protected.
 // Non-protected replicas (after the first N) are deleted first, then protected replicas if needed.
 func (c *ModelServingController) scaleDownServingGroups(ctx context.Context, ms *workloadv1alpha1.ModelServing, servingGroupList []datastore.ServingGroup, expectedCount int) error {
-	partition := c.getPartition(ms)
+	partition, _, _ := c.getPartition(modelServingRolloutConfig(ms), modelServingReplicas(ms))
 
 	// Calculate scores for all servingGroups first
 	allScores := make([]ServingGroupWithScore, 0, len(servingGroupList))
@@ -2475,7 +2487,7 @@ func (c *ModelServingController) deleteServingGroup(ctx context.Context, ms *wor
 	// it can be recreated with its previous revision, following StatefulSet's behavior.
 	if revision, ok := c.store.GetServingGroupRevision(utils.GetNamespaceName(ms), servingGroupName); ok {
 		_, ordinal := utils.GetParentNameAndOrdinal(servingGroupName)
-		partition := c.getPartition(ms)
+		partition, _, _ := c.getPartition(modelServingRolloutConfig(ms), modelServingReplicas(ms))
 		// Record revision history using ControllerRevision for partition-protected servingGroups
 		if partition > 0 && ordinal < partition {
 			// Create ControllerRevision to persist the revision history

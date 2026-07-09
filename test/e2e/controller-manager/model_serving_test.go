@@ -2279,7 +2279,9 @@ func TestModelServingRoleRollingUpdatePartition(t *testing.T) {
 	require.NoError(t, err)
 	scaleDownMS = scaleDownMS.DeepCopy()
 	scaleDownMS.Spec.Template.Roles[0].Replicas = &targetRoleReplicas
-	t.Logf("Scaling down prefill role from %d to %d replicas; expect ordinals 4-7 to remain", initialRoleReplicas, targetRoleReplicas)
+	// Disable partition during scale down so deletionCost keeps high ordinals (4-7).
+	scaleDownMS.Spec.Template.Roles[0].RollingUpdateConfiguration.Partition = ptr.To(intstr.FromInt32(0))
+	t.Logf("Scaling down prefill role from %d to %d replicas with partition=0; expect ordinals 4-7 to remain", initialRoleReplicas, targetRoleReplicas)
 	_, err = kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Update(ctx, scaleDownMS, metav1.UpdateOptions{})
 	require.NoError(t, err)
 	utils.WaitForModelServingReady(t, ctx, kthenaClient, testNamespace, modelServing.Name)
@@ -2328,6 +2330,7 @@ func TestModelServingRoleRollingUpdatePartition(t *testing.T) {
 	require.NoError(t, err)
 	updatedMS := initialMS.DeepCopy()
 	updatedMS.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = nginxAlpineImage
+	updatedMS.Spec.Template.Roles[0].RollingUpdateConfiguration.Partition = ptr.To(intstr.FromInt32(partition))
 
 	t.Logf("Updating prefill role image to %s; partition=%d should keep prefill-4/5 on old image", nginxAlpineImage, partition)
 	_, err = kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Update(ctx, updatedMS, metav1.UpdateOptions{})
@@ -2665,6 +2668,7 @@ func TestModelServingRolePartitionScaleDown(t *testing.T) {
 	require.NoError(t, err)
 	scaleDownMS := currentMS.DeepCopy()
 	scaleDownMS.Spec.Template.Roles[0].Replicas = ptr.To(scaledRoleReplicas)
+	scaleDownMS.Spec.Template.Roles[0].RollingUpdateConfiguration.MaxUnavailable = ptr.To(intstr.FromInt(int(scaledRoleReplicas)))
 	t.Logf("Scaling down prefill role from %d to %d replicas while partition=%d", initialRoleReplicas, scaledRoleReplicas, partition)
 	_, err = kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Update(ctx, scaleDownMS, metav1.UpdateOptions{})
 	require.NoError(t, err)

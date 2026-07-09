@@ -50,10 +50,15 @@ spec:
           ports:
             - containerPort: {{ .Values.kthenaRouter.port }}
               name: http
-          {{- if .Values.kthenaRouter.webhook.enabled }}
+            {{- if .Values.kthenaRouter.webhook.enabled }}
             - containerPort: {{ .Values.kthenaRouter.webhook.port }}
               name: webhook
-          {{- end }}
+            {{- end }}
+            {{- if .Values.kthenaRouter.debugPort }}
+            - containerPort: {{ int .Values.kthenaRouter.debugPort }}
+              name: debug
+              protocol: TCP
+            {{- end }}
           env:
             - name: POD_NAMESPACE
               valueFrom:

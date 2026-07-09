@@ -1014,9 +1014,57 @@ func (c *ModelServingController) scaleUpRoles(ctx context.Context, ms *workloadv
 				continue
 			}
 
-			roleToApply, revisionToUse, hashToUse := c.roleTemplateForReplica(ctx, ms, targetRole, datastore.Role{}, newRevision, true)
+			// Use CurrentRevision for partition-protected ordinals
+			revisionToUse := newRevision
+			if ms.Status.CurrentRevision != "" {
+				revisionToUse = ms.Status.CurrentRevision
+			}
+			// RoleRollingUpdate may advance CurrentRevision before all protected replicas are recovered.
+			if revisionToUse == newRevision {
+				crSelector := labels.SelectorFromSet(map[string]string{
+					utils.ControllerRevisionLabelKey: ms.Name,
+				})
+				if crList, listErr := c.kubeClientSet.AppsV1().ControllerRevisions(ms.Namespace).List(ctx, metav1.ListOptions{
+					LabelSelector: crSelector.String(),
+				}); listErr != nil {
+					klog.Warningf("scaleUpRoles: failed to list ControllerRevisions for ModelServing %s/%s: %v", ms.Namespace, ms.Name, listErr)
+				} else {
+					for i := range crList.Items {
+						rev := crList.Items[i].Labels[utils.ControllerRevisionRevisionLabelKey]
+						if rev != "" && rev != newRevision {
+							revisionToUse = rev
+							break
+						}
+					}
+				}
+			}
 			klog.V(4).Infof("scaleUpRoles: ordinal %d missing (partition-protected), revisionToUse=%s, currentRevision=%s",
 				ordinal, revisionToUse, ms.Status.CurrentRevision)
+
+			// For ordinal < partition, we should use the old template from the revision
+			// Two cases:
+			// 1. First startup: use targetRole (which corresponds to CurrentRevision)
+			// 2. During recovery: use template from ControllerRevision retrieved by revision
+			roleToApply := targetRole
+			cr, _ := utils.GetControllerRevision(ctx, c.kubeClientSet, ms, revisionToUse)
+			if cr != nil {
+				// Case 2: Recovery scenario - use template from ControllerRevision
+				if roles, err := utils.GetRolesFromControllerRevision(cr); err != nil {
+					klog.Warningf("scaleUpRoles: failed to get roles from ControllerRevision for revision %s (ordinal %d): %v, falling back to current role template", revisionToUse, ordinal, err)
+				} else {
+					for _, oldRole := range roles {
+						if oldRole.Name == targetRole.Name {
+							roleToApply = oldRole
+							break
+						}
+					}
+					klog.V(4).Infof("Recovering role %s at ordinal %d with revision %s using template from ControllerRevision (partition=%d)", targetRole.Name, ordinal, revisionToUse, partition)
+				}
+			} else {
+				// Case 1: First startup - ControllerRevision not found, use current role template
+				klog.V(4).Infof("Creating missing role %s at ordinal %d with revision %s using current role template (partition=%d, first startup)", targetRole.Name, ordinal, revisionToUse, partition)
+			}
+			hashToUse := utils.CalRoleTemplateHash(roleToApply)
 			if err := createRole(ordinal, revisionToUse, roleToApply, hashToUse); err != nil {
 				klog.Errorf("%v", err)
 				continue
@@ -1468,6 +1516,22 @@ func (c *ModelServingController) rolesToDeleteForRoleRollingUpdate(ms *workloadv
 			outdatedRoles = filtered
 		}
 		if len(outdatedRoles) == 0 {
+			if partitionConfigured && partition > 0 {
+				expectedHash := utils.CalRoleTemplateHash(roleSpec)
+				for index, role := range roleList {
+					if index >= partition {
+						break
+					}
+					if role.Status == datastore.RoleDeleting {
+						continue
+					}
+					observedHash, ok := c.resolveRoleTemplateHashForComparison(ms, sg, roleSpec.Name, role)
+					if ok && observedHash != expectedHash {
+						hasOutdatedRoles = true
+						break
+					}
+				}
+			}
 			continue
 		}
 		hasOutdatedRoles = true

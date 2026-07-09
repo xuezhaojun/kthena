@@ -613,16 +613,26 @@ func GetMaxUnavailableForRole(role workloadv1alpha1.Role) (int, bool, error) {
 	return maxUnavailable, true, err
 }
 
+// GetPartition returns the partition value from RollingUpdateConfiguration.
+// Returns (0, false, nil) when partition is not configured.
+// If partition is a percentage, it is calculated from replicas (rounded up).
+func GetPartition(config *workloadv1alpha1.RollingUpdateConfiguration, replicas int) (int, bool, error) {
+	if config == nil || config.Partition == nil {
+		return 0, false, nil
+	}
+	partition, err := intstr.GetScaledValueFromIntOrPercent(config.Partition, replicas, true)
+	if err != nil {
+		return 0, true, err
+	}
+	return partition, true, nil
+}
+
 // GetPartitionForRole returns the partition value for a RoleRollingUpdate, or 0 if not set.
 // If the partition is specified as a percentage, it is calculated from role replicas (rounded up).
 func GetPartitionForRole(role workloadv1alpha1.Role) (int, bool, error) {
-	if role.RollingUpdateConfiguration == nil || role.RollingUpdateConfiguration.Partition == nil {
-		return 0, false, nil
-	}
 	replicas := 1
 	if role.Replicas != nil {
 		replicas = int(*role.Replicas)
 	}
-	partition, err := intstr.GetScaledValueFromIntOrPercent(role.RollingUpdateConfiguration.Partition, replicas, true)
-	return partition, true, err
+	return GetPartition(role.RollingUpdateConfiguration, replicas)
 }

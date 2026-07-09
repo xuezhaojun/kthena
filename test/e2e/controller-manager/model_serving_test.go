@@ -2390,6 +2390,333 @@ func TestModelServingRoleRollingUpdatePartition(t *testing.T) {
 	}, 3*time.Minute, 2*time.Second, "RoleRollingUpdate partition state did not converge")
 }
 
+// TestModelServingRolePartitionScaleUp verifies that when a partition-protected role replica is
+// deleted under RoleRecreate, scale-up recreates the missing ordinal with the historical revision
+// instead of creating a new replica at maxOrdinal+1 with the update revision.
+func TestModelServingRolePartitionScaleUp(t *testing.T) {
+	ctx, kthenaClient, kubeClient := setupControllerManagerE2ETest(t)
+
+	const (
+		servingGroupReplicas = int32(1)
+		roleReplicas         = int32(3)
+		partition            = int32(1)
+	)
+
+	modelServing := &workload.ModelServing{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-role-partition-scale-up",
+			Namespace: testNamespace,
+		},
+		Spec: workload.ModelServingSpec{
+			Replicas:       ptr.To(servingGroupReplicas),
+			RecoveryPolicy: workload.RoleRecreate,
+			RolloutStrategy: &workload.RolloutStrategy{
+				Type: workload.RoleRollingUpdate,
+			},
+			Template: workload.ServingGroup{
+				Roles: []workload.Role{
+					{
+						Name:     "prefill",
+						Replicas: ptr.To(roleReplicas),
+						RollingUpdateConfiguration: &workload.RollingUpdateConfiguration{
+							Partition:      ptr.To(intstr.FromInt32(partition)),
+							MaxUnavailable: ptr.To(intstr.FromInt(int(roleReplicas))),
+						},
+						EntryTemplate: workload.PodTemplateSpec{
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{{
+									Name:  "test-container",
+									Image: nginxImage,
+									Ports: []corev1.ContainerPort{{Name: "http", ContainerPort: 80}},
+								}},
+							},
+						},
+						WorkerReplicas: 0,
+					},
+				},
+			},
+		},
+	}
+
+	selector := fmt.Sprintf("%s,%s=prefill,%s=%s", modelServingLabelSelector(modelServing.Name), workload.RoleLabelKey, workload.EntryLabelKey, controllerutils.Entry)
+
+	t.Logf("Creating ModelServing with %d prefill replicas and partition=%d", roleReplicas, partition)
+	createAndWaitForModelServing(t, ctx, kthenaClient, modelServing)
+	waitForRunningPodCount(t, ctx, kubeClient, modelServing.Name, int(roleReplicas), 3*time.Minute)
+
+	initialMS, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, modelServing.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	initialRevision := initialMS.Status.CurrentRevision
+	require.NotEmpty(t, initialRevision, "Initial CurrentRevision should be set")
+
+	updatedMS := initialMS.DeepCopy()
+	updatedMS.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = nginxAlpineImage
+	t.Logf("Updating prefill role image to %s to establish partition state", nginxAlpineImage)
+	_, err = kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Update(ctx, updatedMS, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	utils.WaitForModelServingReady(t, ctx, kthenaClient, testNamespace, modelServing.Name)
+
+	var updateRevision string
+	require.Eventually(t, func() bool {
+		pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+		if err != nil || len(pods.Items) != int(roleReplicas) {
+			return false
+		}
+		imageByOrdinal := map[int32]string{}
+		for _, pod := range pods.Items {
+			if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning || len(pod.Spec.Containers) == 0 {
+				continue
+			}
+			roleID := pod.Labels[workload.RoleIDKey]
+			_, ordinal := controllerutils.GetParentNameAndOrdinal(roleID)
+			imageByOrdinal[int32(ordinal)] = pod.Spec.Containers[0].Image
+		}
+		if len(imageByOrdinal) != int(roleReplicas) {
+			return false
+		}
+		if imageByOrdinal[0] != nginxImage || imageByOrdinal[1] != nginxAlpineImage || imageByOrdinal[2] != nginxAlpineImage {
+			t.Logf("Partition state not ready: ordinal images=%v", imageByOrdinal)
+			return false
+		}
+		ms, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, modelServing.Name, metav1.GetOptions{})
+		if err != nil || ms.Status.UpdateRevision == "" || ms.Status.UpdateRevision == initialRevision {
+			return false
+		}
+		updateRevision = ms.Status.UpdateRevision
+		return true
+	}, 3*time.Minute, 2*time.Second, "Role partition state did not converge before scale up recovery test")
+
+	pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	require.NoError(t, err)
+	var podToDelete *corev1.Pod
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		roleID := pod.Labels[workload.RoleIDKey]
+		_, ordinal := controllerutils.GetParentNameAndOrdinal(roleID)
+		if ordinal == 0 {
+			podToDelete = pod
+			break
+		}
+	}
+	require.NotNil(t, podToDelete, "prefill-0 pod should exist")
+	originalUID := string(podToDelete.UID)
+	t.Logf("Deleting protected prefill-0 pod %s", podToDelete.Name)
+	err = kubeClient.CoreV1().Pods(testNamespace).Delete(ctx, podToDelete.Name, metav1.DeleteOptions{})
+	require.NoError(t, err)
+
+	utils.WaitForModelServingReady(t, ctx, kthenaClient, testNamespace, modelServing.Name)
+
+	require.Eventually(t, func() bool {
+		pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+		if err != nil {
+			t.Logf("Failed to list prefill entry pods: %v", err)
+			return false
+		}
+		if len(pods.Items) != int(roleReplicas) {
+			t.Logf("Prefill pod count=%d, expecting %d", len(pods.Items), roleReplicas)
+			return false
+		}
+
+		imageByOrdinal := map[int32]string{}
+		revisionByOrdinal := map[int32]string{}
+		uidByOrdinal := map[int32]string{}
+		for _, pod := range pods.Items {
+			if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning || len(pod.Spec.Containers) == 0 {
+				continue
+			}
+			roleID := pod.Labels[workload.RoleIDKey]
+			_, ordinal := controllerutils.GetParentNameAndOrdinal(roleID)
+			ord := int32(ordinal)
+			imageByOrdinal[ord] = pod.Spec.Containers[0].Image
+			revisionByOrdinal[ord] = pod.Labels[workload.RevisionLabelKey]
+			uidByOrdinal[ord] = string(pod.UID)
+		}
+		if len(imageByOrdinal) != int(roleReplicas) {
+			t.Logf("Observed ordinals=%d, expecting %d", len(imageByOrdinal), roleReplicas)
+			return false
+		}
+		if _, ok := imageByOrdinal[3]; ok {
+			t.Log("Unexpected prefill-3 created instead of recreating prefill-0")
+			return false
+		}
+		if imageByOrdinal[0] != nginxImage {
+			t.Logf("Recreated prefill-0 image=%s, expecting old image=%s", imageByOrdinal[0], nginxImage)
+			return false
+		}
+		if revisionByOrdinal[0] != initialRevision {
+			t.Logf("Recreated prefill-0 revision=%s, expecting %s", revisionByOrdinal[0], initialRevision)
+			return false
+		}
+		if uidByOrdinal[0] == originalUID {
+			t.Log("prefill-0 was not recreated with a new UID")
+			return false
+		}
+		if imageByOrdinal[1] != nginxAlpineImage || imageByOrdinal[2] != nginxAlpineImage {
+			t.Logf("Updated replicas changed unexpectedly: images=%v", imageByOrdinal)
+			return false
+		}
+		if revisionByOrdinal[1] != updateRevision || revisionByOrdinal[2] != updateRevision {
+			t.Logf("Updated replicas revision changed unexpectedly: revisions=%v", revisionByOrdinal)
+			return false
+		}
+		return true
+	}, 3*time.Minute, 2*time.Second, "Partition-protected role replica should be recreated at ordinal 0 with historical revision")
+
+	t.Log("ModelServing role partition scale up test passed successfully")
+}
+
+// TestModelServingRolePartitionScaleDown verifies that scaling down a role while partition is active
+// removes updated replicas first and leaves partition-protected replicas untouched.
+func TestModelServingRolePartitionScaleDown(t *testing.T) {
+	ctx, kthenaClient, kubeClient := setupControllerManagerE2ETest(t)
+
+	const (
+		servingGroupReplicas = int32(1)
+		initialRoleReplicas  = int32(5)
+		scaledRoleReplicas   = int32(3)
+		partition            = int32(3)
+	)
+
+	modelServing := &workload.ModelServing{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-role-partition-scale-down",
+			Namespace: testNamespace,
+		},
+		Spec: workload.ModelServingSpec{
+			Replicas:       ptr.To(servingGroupReplicas),
+			RecoveryPolicy: workload.RoleRecreate,
+			RolloutStrategy: &workload.RolloutStrategy{
+				Type: workload.RoleRollingUpdate,
+			},
+			Template: workload.ServingGroup{
+				Roles: []workload.Role{
+					{
+						Name:     "prefill",
+						Replicas: ptr.To(initialRoleReplicas),
+						RollingUpdateConfiguration: &workload.RollingUpdateConfiguration{
+							Partition:      ptr.To(intstr.FromInt32(partition)),
+							MaxUnavailable: ptr.To(intstr.FromInt(int(initialRoleReplicas))),
+						},
+						EntryTemplate: workload.PodTemplateSpec{
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{{
+									Name:  "test-container",
+									Image: nginxImage,
+									Ports: []corev1.ContainerPort{{Name: "http", ContainerPort: 80}},
+								}},
+							},
+						},
+						WorkerReplicas: 0,
+					},
+				},
+			},
+		},
+	}
+
+	selector := fmt.Sprintf("%s,%s=prefill,%s=%s", modelServingLabelSelector(modelServing.Name), workload.RoleLabelKey, workload.EntryLabelKey, controllerutils.Entry)
+
+	t.Logf("Creating ModelServing with %d prefill replicas and partition=%d", initialRoleReplicas, partition)
+	createAndWaitForModelServing(t, ctx, kthenaClient, modelServing)
+	waitForRunningPodCount(t, ctx, kubeClient, modelServing.Name, int(initialRoleReplicas), 3*time.Minute)
+
+	initialMS, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, modelServing.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	initialRevision := initialMS.Status.CurrentRevision
+	require.NotEmpty(t, initialRevision, "Initial CurrentRevision should be set")
+
+	updatedMS := initialMS.DeepCopy()
+	updatedMS.Spec.Template.Roles[0].EntryTemplate.Spec.Containers[0].Image = nginxAlpineImage
+	t.Logf("Updating prefill role image to %s to establish partition state", nginxAlpineImage)
+	_, err = kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Update(ctx, updatedMS, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	utils.WaitForModelServingReady(t, ctx, kthenaClient, testNamespace, modelServing.Name)
+
+	require.Eventually(t, func() bool {
+		pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+		if err != nil || len(pods.Items) != int(initialRoleReplicas) {
+			return false
+		}
+		imageByOrdinal := map[int32]string{}
+		for _, pod := range pods.Items {
+			if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning || len(pod.Spec.Containers) == 0 {
+				continue
+			}
+			roleID := pod.Labels[workload.RoleIDKey]
+			_, ordinal := controllerutils.GetParentNameAndOrdinal(roleID)
+			imageByOrdinal[int32(ordinal)] = pod.Spec.Containers[0].Image
+		}
+		if len(imageByOrdinal) != int(initialRoleReplicas) {
+			return false
+		}
+		for ord := int32(0); ord < partition; ord++ {
+			if imageByOrdinal[ord] != nginxImage {
+				return false
+			}
+		}
+		for ord := partition; ord < initialRoleReplicas; ord++ {
+			if imageByOrdinal[ord] != nginxAlpineImage {
+				return false
+			}
+		}
+		return true
+	}, 3*time.Minute, 2*time.Second, "Role partition state did not converge before scale down")
+
+	currentMS, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, modelServing.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	scaleDownMS := currentMS.DeepCopy()
+	scaleDownMS.Spec.Template.Roles[0].Replicas = ptr.To(scaledRoleReplicas)
+	t.Logf("Scaling down prefill role from %d to %d replicas while partition=%d", initialRoleReplicas, scaledRoleReplicas, partition)
+	_, err = kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Update(ctx, scaleDownMS, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	utils.WaitForModelServingReady(t, ctx, kthenaClient, testNamespace, modelServing.Name)
+
+	require.Eventually(t, func() bool {
+		pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+		if err != nil {
+			t.Logf("Failed to list prefill entry pods: %v", err)
+			return false
+		}
+		if len(pods.Items) != int(scaledRoleReplicas) {
+			t.Logf("Prefill pod count=%d, expecting %d", len(pods.Items), scaledRoleReplicas)
+			return false
+		}
+
+		imageByOrdinal := map[int32]string{}
+		revisionByOrdinal := map[int32]string{}
+		for _, pod := range pods.Items {
+			if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning || len(pod.Spec.Containers) == 0 {
+				continue
+			}
+			roleID := pod.Labels[workload.RoleIDKey]
+			_, ordinal := controllerutils.GetParentNameAndOrdinal(roleID)
+			ord := int32(ordinal)
+			imageByOrdinal[ord] = pod.Spec.Containers[0].Image
+			revisionByOrdinal[ord] = pod.Labels[workload.RevisionLabelKey]
+		}
+		if len(imageByOrdinal) != int(scaledRoleReplicas) {
+			t.Logf("Observed ordinals=%d, expecting %d", len(imageByOrdinal), scaledRoleReplicas)
+			return false
+		}
+		for ord := int32(0); ord < scaledRoleReplicas; ord++ {
+			if imageByOrdinal[ord] != nginxImage {
+				t.Logf("Protected prefill-%d image=%s, expecting old image=%s", ord, imageByOrdinal[ord], nginxImage)
+				return false
+			}
+			if revisionByOrdinal[ord] != initialRevision {
+				t.Logf("Protected prefill-%d revision=%s, expecting %s", ord, revisionByOrdinal[ord], initialRevision)
+				return false
+			}
+		}
+		if _, ok := imageByOrdinal[partition]; ok {
+			t.Logf("Updated replica prefill-%d should have been removed", partition)
+			return false
+		}
+		return true
+	}, 3*time.Minute, 2*time.Second, "Scale down should keep only partition-protected role replicas")
+
+	t.Log("ModelServing role partition scale down test passed successfully")
+}
+
 // TestModelServingBinPackScaleDownServingGroup tests bin pack scale down at ServingGroup level
 func TestModelServingBinPackScaleDownServingGroup(t *testing.T) {
 	ctx, kthenaClient, kubeClient := setupControllerManagerE2ETest(t)

@@ -96,6 +96,19 @@ func setupTestRouter(t *testing.T, backendHandler http.Handler) (*Router, datast
 	return router, store, backend
 }
 
+type modelServerDeletedStore struct {
+	datastore.Store
+	modelServer *aiv1alpha1.ModelServer
+}
+
+func (s *modelServerDeletedStore) GetModelServer(types.NamespacedName) *aiv1alpha1.ModelServer {
+	return s.modelServer
+}
+
+func (s *modelServerDeletedStore) GetPodsByModelServer(name types.NamespacedName) ([]*datastore.PodInfo, error) {
+	return nil, fmt.Errorf("model server not found: %v", name)
+}
+
 func TestRouter_HandleHTTPRoute_PathPrefix(t *testing.T) {
 	pathType := gatewayv1.PathMatchPathPrefix
 	kind := gatewayv1.Kind("Gateway")
@@ -1005,56 +1018,104 @@ func TestRouter_HandlerFunc_BackendUnavailable(t *testing.T) {
 	}
 }
 
-func TestRouter_HandlerFunc_InferencePoolWithoutPods(t *testing.T) {
-	router, store, backend := setupTestRouter(t, nil)
-	defer backend.Close()
-
-	pathType := gatewayv1.PathMatchPathPrefix
-	pathValue := "/"
-	gatewayKind := gatewayv1.Kind("Gateway")
-	poolGroup := inferencePoolBackendGroup
-	poolKind := inferencePoolBackendKind
-	httpRoute := &gatewayv1.HTTPRoute{
-		ObjectMeta: v1.ObjectMeta{Name: "route-unavailable", Namespace: "default"},
-		Spec: gatewayv1.HTTPRouteSpec{
-			CommonRouteSpec: gatewayv1.CommonRouteSpec{
-				ParentRefs: []gatewayv1.ParentReference{{Name: "gw", Kind: &gatewayKind}},
+func TestRouter_HandlerFunc_InferencePoolPodDiscovery(t *testing.T) {
+	tests := []struct {
+		name             string
+		matchLabels      map[inferencev1.LabelKey]inferencev1.LabelValue
+		expectedStatus   int
+		expectedResponse string
+	}{
+		{
+			name: "no matching pods is unavailable",
+			matchLabels: map[inferencev1.LabelKey]inferencev1.LabelValue{
+				"app": "missing",
 			},
-			Rules: []gatewayv1.HTTPRouteRule{{
-				Matches: []gatewayv1.HTTPRouteMatch{{
-					Path: &gatewayv1.HTTPPathMatch{Type: &pathType, Value: &pathValue},
-				}},
-				BackendRefs: []gatewayv1.HTTPBackendRef{{
-					BackendRef: gatewayv1.BackendRef{
-						BackendObjectReference: gatewayv1.BackendObjectReference{
-							Group: &poolGroup,
-							Kind:  &poolKind,
-							Name:  "pool-unavailable",
-						},
-					},
-				}},
-			}},
+			expectedStatus:   http.StatusServiceUnavailable,
+			expectedResponse: "no available pods for inference pool",
+		},
+		{
+			name: "invalid selector is an internal error",
+			matchLabels: map[inferencev1.LabelKey]inferencev1.LabelValue{
+				"invalid key": "value",
+			},
+			expectedStatus:   http.StatusInternalServerError,
+			expectedResponse: "failed to get pods for inference pool",
 		},
 	}
-	inferencePool := &inferencev1.InferencePool{
-		ObjectMeta: v1.ObjectMeta{Name: "pool-unavailable", Namespace: "default"},
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			router, store, backend := setupTestRouter(t, nil)
+			defer backend.Close()
+
+			pathType := gatewayv1.PathMatchPathPrefix
+			pathValue := "/"
+			gatewayKind := gatewayv1.Kind("Gateway")
+			poolGroup := inferencePoolBackendGroup
+			poolKind := inferencePoolBackendKind
+			httpRoute := &gatewayv1.HTTPRoute{
+				ObjectMeta: v1.ObjectMeta{Name: "route-unavailable", Namespace: "default"},
+				Spec: gatewayv1.HTTPRouteSpec{
+					CommonRouteSpec: gatewayv1.CommonRouteSpec{
+						ParentRefs: []gatewayv1.ParentReference{{Name: "gw", Kind: &gatewayKind}},
+					},
+					Rules: []gatewayv1.HTTPRouteRule{{
+						Matches: []gatewayv1.HTTPRouteMatch{{
+							Path: &gatewayv1.HTTPPathMatch{Type: &pathType, Value: &pathValue},
+						}},
+						BackendRefs: []gatewayv1.HTTPBackendRef{{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Group: &poolGroup,
+									Kind:  &poolKind,
+									Name:  "pool-unavailable",
+								},
+							},
+						}},
+					}},
+				},
+			}
+			inferencePool := &inferencev1.InferencePool{
+				ObjectMeta: v1.ObjectMeta{Name: "pool-unavailable", Namespace: "default"},
+				Spec: inferencev1.InferencePoolSpec{
+					Selector: inferencev1.LabelSelector{MatchLabels: tt.matchLabels},
+				},
+			}
+			assert.NoError(t, store.AddOrUpdateHTTPRoute(httpRoute))
+			assert.NoError(t, store.AddOrUpdateInferencePool(inferencePool))
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Set(GatewayKey, "default/gw")
+			requestBody := `{"model":"inference-model","prompt":"hello"}`
+			var err error
+			c.Request, err = http.NewRequest(http.MethodPost, "/custom", bytes.NewBufferString(requestBody))
+			assert.NoError(t, err)
+			c.Request.Header.Set("Content-Type", "application/json")
+
+			router.HandlerFunc()(c)
+
+			assert.Equal(t, tt.expectedStatus, w.Code)
+			assert.Contains(t, w.Body.String(), tt.expectedResponse)
+		})
 	}
-	assert.NoError(t, store.AddOrUpdateHTTPRoute(httpRoute))
-	assert.NoError(t, store.AddOrUpdateInferencePool(inferencePool))
+}
 
-	w := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(w)
-	c.Set(GatewayKey, "default/gw")
-	requestBody := `{"model":"inference-model","prompt":"hello"}`
-	var err error
-	c.Request, err = http.NewRequest(http.MethodPost, "/custom", bytes.NewBufferString(requestBody))
-	assert.NoError(t, err)
-	c.Request.Header.Set("Content-Type", "application/json")
+func TestRouter_GetPodsAndServer_ModelServerDeletedDuringPodLookup(t *testing.T) {
+	modelServerName := types.NamespacedName{Name: "deleted", Namespace: "default"}
+	modelServer := &aiv1alpha1.ModelServer{
+		ObjectMeta: v1.ObjectMeta{Name: modelServerName.Name, Namespace: modelServerName.Namespace},
+	}
+	router := &Router{store: &modelServerDeletedStore{
+		Store:       datastore.New(),
+		modelServer: modelServer,
+	}}
 
-	router.HandlerFunc()(c)
+	pods, foundModelServer, err := router.getPodsAndServer(modelServerName)
 
-	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
-	assert.Contains(t, w.Body.String(), "no available pods for inference pool")
+	assert.Error(t, err)
+	assert.Nil(t, pods)
+	assert.Nil(t, foundModelServer)
 }
 
 func TestRouter_HandlerFunc_ScheduleFailure(t *testing.T) {

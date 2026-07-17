@@ -448,8 +448,14 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 
 		// Get pods from InferencePool
 		pods, err = r.store.GetPodsByInferencePool(inferencePoolName)
-		if err != nil || len(pods) == 0 {
+		if err != nil {
 			klog.Errorf("failed to get pods for inference pool: %v, %v", inferencePoolName, err)
+			accesslog.SetError(c, "pod_discovery", fmt.Sprintf("failed to get pods for inference pool: %v", inferencePoolName))
+			c.AbortWithStatusJSON(http.StatusInternalServerError, fmt.Sprintf("failed to get pods for inference pool: %v", inferencePoolName))
+			return fmt.Errorf("failed to get pods for inference pool %v: %w", inferencePoolName, err)
+		}
+		if len(pods) == 0 {
+			klog.Errorf("no available pods for inference pool: %v", inferencePoolName)
 			accesslog.SetError(c, "pod_discovery", fmt.Sprintf("no available pods for inference pool: %v", inferencePoolName))
 			c.AbortWithStatusJSON(http.StatusServiceUnavailable, fmt.Sprintf("no available pods for inference pool: %v", inferencePoolName))
 			return fmt.Errorf("no available pods for inference pool: %v", inferencePoolName)
@@ -582,8 +588,11 @@ func (r *Router) getPodsAndServer(modelServerName types.NamespacedName) ([]*data
 	}
 
 	pods, err := r.store.GetPodsByModelServer(modelServerName)
-	if err != nil || len(pods) == 0 {
-		return nil, modelServer, fmt.Errorf("can't find target pods of model server: %v, err: %v", modelServerName, err)
+	if err != nil {
+		return nil, nil, fmt.Errorf("can't find target pods of model server: %v, err: %w", modelServerName, err)
+	}
+	if len(pods) == 0 {
+		return nil, modelServer, fmt.Errorf("can't find target pods of model server: %v", modelServerName)
 	}
 	return pods, modelServer, nil
 }

@@ -495,6 +495,7 @@ func (pq *RequestPriorityQueue) requeueRequest(req *Request) {
 	default:
 	}
 	heap.Push(pq, req)
+	pq.metricIncSize(req.ModelName, req.UserID)
 	pq.mu.Unlock()
 	select {
 	case pq.notifyCh <- struct{}{}:
@@ -608,11 +609,10 @@ func (pq *RequestPriorityQueue) Close() {
 
 	// Drain pending items and clear their metrics while holding the queue lock so
 	// concurrent PushRequest calls cannot add work after shutdown begins.
-	pending := make([]*Request, 0, len(pq.heap))
-	for len(pq.heap) > 0 {
-		req := heap.Pop(pq).(*Request)
+	pending := pq.heap
+	pq.heap = nil
+	for _, req := range pending {
 		pq.metricDecSize(req.ModelName, req.UserID)
-		pending = append(pending, req)
 	}
 	pq.mu.Unlock()
 

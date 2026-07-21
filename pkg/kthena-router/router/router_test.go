@@ -28,10 +28,12 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"istio.io/istio/pkg/util/sets"
 	corev1 "k8s.io/api/core/v1"
@@ -847,6 +849,92 @@ func TestRouter_HandlerFunc_ModelNotFound(t *testing.T) {
 
 	assert.Equal(t, http.StatusNotFound, w.Code)
 	assert.Contains(t, w.Body.String(), "route not found")
+}
+
+func metricModelCount(t *testing.T, name, prefix string) int {
+	t.Helper()
+
+	families, err := prometheus.DefaultGatherer.Gather()
+	assert.NoError(t, err)
+
+	count := 0
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			for _, label := range metric.GetLabel() {
+				if label.GetName() == metrics.LabelModel && strings.HasPrefix(label.GetValue(), prefix) {
+					count++
+				}
+			}
+		}
+	}
+	return count
+}
+
+func requestCounterValue(t *testing.T, labels map[string]string) float64 {
+	t.Helper()
+
+	families, err := prometheus.DefaultGatherer.Gather()
+	assert.NoError(t, err)
+
+	for _, family := range families {
+		if family.GetName() != "kthena_router_requests_total" {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			matched := true
+			for name, value := range labels {
+				found := false
+				for _, label := range metric.GetLabel() {
+					if label.GetName() == name && label.GetValue() == value {
+						found = true
+						break
+					}
+				}
+				if !found {
+					matched = false
+					break
+				}
+			}
+			if matched {
+				return metric.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
+}
+
+func TestRouter_HandlerFunc_UnknownModelMetricsUseBoundedLabel(t *testing.T) {
+	router, _, backend := setupTestRouter(t, nil)
+	defer backend.Close()
+
+	prefix := "cardinality-proof-test-"
+	requestLabels := map[string]string{
+		metrics.LabelModel:      metrics.UnknownModel,
+		metrics.LabelPath:       "/v1/chat/completions",
+		metrics.LabelStatusCode: "404",
+		metrics.LabelErrorType:  "route_not_found",
+	}
+	requestsBefore := requestCounterValue(t, requestLabels)
+
+	for i := 0; i < 3; i++ {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		reqBody := fmt.Sprintf(`{"model":"%s%d","prompt":"hello"}`, prefix, i)
+		c.Request, _ = http.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(reqBody))
+		c.Request.Header.Set("Content-Type", "application/json")
+
+		router.HandlerFunc()(c)
+
+		assert.Equal(t, http.StatusNotFound, w.Code)
+		assert.Contains(t, w.Body.String(), "route not found")
+	}
+
+	assert.Equal(t, 0, metricModelCount(t, "kthena_router_requests_total", prefix))
+	assert.Equal(t, 0, metricModelCount(t, "kthena_router_active_downstream_requests", prefix))
+	assert.Equal(t, float64(3), requestCounterValue(t, requestLabels)-requestsBefore)
 }
 
 func TestRouter_HandlerFunc_ScheduleFailure(t *testing.T) {

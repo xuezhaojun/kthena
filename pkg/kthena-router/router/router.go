@@ -415,16 +415,18 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 		klog.V(4).Infof("modelServer is %v, is_lora: %v", modelServerName, isLora)
 
 		pods, modelServer, err = r.getPodsAndServer(modelServerName)
-		if err != nil || len(pods) == 0 {
+		if err != nil {
 			klog.Errorf("failed to get pods and model server: %v, %v", modelServerName, err)
-			if modelServer != nil {
-				accesslog.SetError(c, "pod_discovery", fmt.Sprintf("no available pods for model server: %v", modelServerName))
-				c.AbortWithStatusJSON(http.StatusServiceUnavailable, fmt.Sprintf("no available pods for model server: %v", modelServerName))
-				return fmt.Errorf("no available pods for model server: %v", modelServerName)
-			}
+		}
+		if modelServer == nil {
 			accesslog.SetError(c, "pod_discovery", fmt.Sprintf("can't find model server: %v", modelServerName))
 			c.AbortWithStatusJSON(http.StatusNotFound, fmt.Sprintf("can't find model server: %v", modelServerName))
 			return fmt.Errorf("can't find model server: %v", modelServerName)
+		}
+		if len(pods) == 0 {
+			accesslog.SetError(c, "pod_discovery", fmt.Sprintf("no available pods for model server: %v", modelServerName))
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, fmt.Sprintf("no available pods for model server: %v", modelServerName))
+			return fmt.Errorf("no available pods for model server: %v", modelServerName)
 		}
 
 		model := modelServer.Spec.Model
@@ -590,9 +592,6 @@ func (r *Router) getPodsAndServer(modelServerName types.NamespacedName) ([]*data
 	pods, err := r.store.GetPodsByModelServer(modelServerName)
 	if err != nil {
 		return nil, nil, fmt.Errorf("can't find target pods of model server: %v, err: %w", modelServerName, err)
-	}
-	if len(pods) == 0 {
-		return nil, modelServer, fmt.Errorf("can't find target pods of model server: %v", modelServerName)
 	}
 	return pods, modelServer, nil
 }

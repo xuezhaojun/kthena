@@ -58,7 +58,22 @@ const (
 	// Context keys for gin context
 	GatewayKey = "gatewayKey"
 	PromptKey  = "promptKey" // store parsed ChatMessage, which will be reused
+
+	successfulRequestFinishReason = "successful_request"
+	failedRequestFinishReason     = "request_failed"
 )
+
+func requestFinishReason(c *gin.Context) string {
+	if reason, exists := c.Get("finishReason"); exists {
+		if value, ok := reason.(string); ok && value != "" {
+			return value
+		}
+	}
+	if c.Writer.Status() >= http.StatusBadRequest {
+		return failedRequestFinishReason
+	}
+	return successfulRequestFinishReason
+}
 
 func getEnvBool(key string, fallback bool) bool {
 	if value, ok := os.LookupEnv(key); ok {
@@ -292,11 +307,7 @@ func (r *Router) HandlerFunc() gin.HandlerFunc {
 			r.metrics.DecActiveDownstreamRequests(metricsModel)
 			if metricsRecorder != nil {
 				statusCode := strconv.Itoa(c.Writer.Status())
-				reason := "successful_request"
-				if r, exists := c.Get("finishReason"); exists {
-					reason = r.(string)
-				}
-				metricsRecorder.Finish(statusCode, reason)
+				metricsRecorder.Finish(statusCode, requestFinishReason(c))
 			}
 		}()
 
@@ -421,11 +432,13 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 		if modelServer == nil {
 			accesslog.SetError(c, "pod_discovery", fmt.Sprintf("can't find model server: %v", modelServerName))
 			c.AbortWithStatusJSON(http.StatusNotFound, fmt.Sprintf("can't find model server: %v", modelServerName))
+			c.Set("finishReason", "pod_discovery")
 			return fmt.Errorf("can't find model server: %v", modelServerName)
 		}
 		if len(pods) == 0 {
 			accesslog.SetError(c, "pod_discovery", fmt.Sprintf("no available pods for model server: %v", modelServerName))
 			c.AbortWithStatusJSON(http.StatusServiceUnavailable, fmt.Sprintf("no available pods for model server: %v", modelServerName))
+			c.Set("finishReason", "pod_discovery")
 			return fmt.Errorf("no available pods for model server: %v", modelServerName)
 		}
 
@@ -445,6 +458,7 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 			klog.Errorf("failed to get inference pool: %v", inferencePoolName)
 			accesslog.SetError(c, "inference_pool_discovery", fmt.Sprintf("can't find inference pool: %v", inferencePoolName))
 			c.AbortWithStatusJSON(http.StatusNotFound, fmt.Sprintf("can't find inference pool: %v", inferencePoolName))
+			c.Set("finishReason", "inference_pool_discovery")
 			return fmt.Errorf("can't find inference pool: %v", inferencePoolName)
 		}
 
@@ -452,14 +466,22 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 		pods, err = r.store.GetPodsByInferencePool(inferencePoolName)
 		if err != nil {
 			klog.Errorf("failed to get pods for inference pool: %v, %v", inferencePoolName, err)
+			if r.store.GetInferencePool(inferencePoolKey) == nil {
+				accesslog.SetError(c, "inference_pool_discovery", fmt.Sprintf("can't find inference pool: %v", inferencePoolName))
+				c.AbortWithStatusJSON(http.StatusNotFound, fmt.Sprintf("can't find inference pool: %v", inferencePoolName))
+				c.Set("finishReason", "inference_pool_discovery")
+				return fmt.Errorf("can't find inference pool %v: %w", inferencePoolName, err)
+			}
 			accesslog.SetError(c, "pod_discovery", fmt.Sprintf("failed to get pods for inference pool: %v", inferencePoolName))
 			c.AbortWithStatusJSON(http.StatusInternalServerError, fmt.Sprintf("failed to get pods for inference pool: %v", inferencePoolName))
+			c.Set("finishReason", "pod_discovery")
 			return fmt.Errorf("failed to get pods for inference pool %v: %w", inferencePoolName, err)
 		}
 		if len(pods) == 0 {
 			klog.Errorf("no available pods for inference pool: %v", inferencePoolName)
 			accesslog.SetError(c, "pod_discovery", fmt.Sprintf("no available pods for inference pool: %v", inferencePoolName))
 			c.AbortWithStatusJSON(http.StatusServiceUnavailable, fmt.Sprintf("no available pods for inference pool: %v", inferencePoolName))
+			c.Set("finishReason", "pod_discovery")
 			return fmt.Errorf("no available pods for inference pool: %v", inferencePoolName)
 		}
 
@@ -468,6 +490,7 @@ func (r *Router) doLoadbalance(c *gin.Context, modelRequest ModelRequest) error 
 			klog.Errorf("inference pool %v has no target ports", inferencePoolName)
 			accesslog.SetError(c, "port_discovery", fmt.Sprintf("inference pool %v has no target ports", inferencePoolName))
 			c.AbortWithStatusJSON(http.StatusBadRequest, fmt.Sprintf("inference pool %v has no target ports", inferencePoolName))
+			c.Set("finishReason", "port_discovery")
 			return fmt.Errorf("inference pool %v has no target ports", inferencePoolName)
 		}
 		// Use the first target port
@@ -749,6 +772,7 @@ func (r *Router) proxy(
 		return nil
 	}
 	c.AbortWithStatusJSON(http.StatusServiceUnavailable, "request to all pods failed")
+	c.Set("finishReason", "proxy")
 	return fmt.Errorf("request to all pods failed")
 }
 

@@ -29,6 +29,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -107,6 +108,23 @@ func (s *modelServerDeletedStore) GetModelServer(types.NamespacedName) *aiv1alph
 
 func (s *modelServerDeletedStore) GetPodsByModelServer(name types.NamespacedName) ([]*datastore.PodInfo, error) {
 	return nil, fmt.Errorf("model server not found: %v", name)
+}
+
+type inferencePoolDeletedStore struct {
+	datastore.Store
+	inferencePool *inferencev1.InferencePool
+	getCalls      atomic.Int32
+}
+
+func (s *inferencePoolDeletedStore) GetInferencePool(string) *inferencev1.InferencePool {
+	if s.getCalls.Add(1) == 1 {
+		return s.inferencePool
+	}
+	return nil
+}
+
+func (s *inferencePoolDeletedStore) GetPodsByInferencePool(name types.NamespacedName) ([]*datastore.PodInfo, error) {
+	return nil, fmt.Errorf("inferencepool not found: %v", name)
 }
 
 func TestRouter_HandleHTTPRoute_PathPrefix(t *testing.T) {
@@ -903,6 +921,45 @@ func requestCounterValue(t *testing.T, router *Router, model, path, statusCode, 
 	return metric.GetCounter().GetValue()
 }
 
+func TestRequestFinishReason(t *testing.T) {
+	tests := []struct {
+		name           string
+		status         int
+		explicitReason string
+		expectedReason string
+	}{
+		{
+			name:           "successful response",
+			status:         http.StatusOK,
+			expectedReason: successfulRequestFinishReason,
+		},
+		{
+			name:           "unclassified error response",
+			status:         http.StatusServiceUnavailable,
+			expectedReason: failedRequestFinishReason,
+		},
+		{
+			name:           "explicit reason takes precedence",
+			status:         http.StatusServiceUnavailable,
+			explicitReason: "pod_discovery",
+			expectedReason: "pod_discovery",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Status(tt.status)
+			if tt.explicitReason != "" {
+				c.Set("finishReason", tt.explicitReason)
+			}
+
+			assert.Equal(t, tt.expectedReason, requestFinishReason(c))
+		})
+	}
+}
+
 func TestRouter_HandlerFunc_UnknownModelMetricsUseBoundedLabel(t *testing.T) {
 	router, _, backend := setupTestRouter(t, nil)
 	defer backend.Close()
@@ -934,17 +991,20 @@ func TestRouter_HandlerFunc_BackendUnavailable(t *testing.T) {
 		addPod           bool
 		expectedStatus   int
 		expectedResponse string
+		expectedReason   string
 	}{
 		{
 			name:             "missing model server remains not found",
 			expectedStatus:   http.StatusNotFound,
 			expectedResponse: "can't find model server",
+			expectedReason:   "pod_discovery",
 		},
 		{
 			name:             "model server without pods is unavailable",
 			addModelServer:   true,
 			expectedStatus:   http.StatusServiceUnavailable,
 			expectedResponse: "no available pods for model server",
+			expectedReason:   "pod_discovery",
 		},
 		{
 			name:             "all backend requests fail",
@@ -952,6 +1012,7 @@ func TestRouter_HandlerFunc_BackendUnavailable(t *testing.T) {
 			addPod:           true,
 			expectedStatus:   http.StatusServiceUnavailable,
 			expectedResponse: "request to all pods failed",
+			expectedReason:   "proxy",
 		},
 	}
 
@@ -1003,6 +1064,10 @@ func TestRouter_HandlerFunc_BackendUnavailable(t *testing.T) {
 			}
 			store.AddOrUpdateModelRoute(modelRoute)
 
+			requestsBefore := requestCounterValue(
+				t, router, "unavailable-model", "/v1/chat/completions",
+				strconv.Itoa(tt.expectedStatus), tt.expectedReason,
+			)
 			w := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(w)
 			requestBody := `{"model":"unavailable-model","prompt":"hello"}`
@@ -1014,6 +1079,10 @@ func TestRouter_HandlerFunc_BackendUnavailable(t *testing.T) {
 
 			assert.Equal(t, tt.expectedStatus, w.Code)
 			assert.Contains(t, w.Body.String(), tt.expectedResponse)
+			assert.Equal(t, float64(1), requestCounterValue(
+				t, router, "unavailable-model", "/v1/chat/completions",
+				strconv.Itoa(tt.expectedStatus), tt.expectedReason,
+			)-requestsBefore)
 		})
 	}
 }
@@ -1022,8 +1091,10 @@ func TestRouter_HandlerFunc_InferencePoolPodDiscovery(t *testing.T) {
 	tests := []struct {
 		name             string
 		matchLabels      map[inferencev1.LabelKey]inferencev1.LabelValue
+		deleteDuringRead bool
 		expectedStatus   int
 		expectedResponse string
+		expectedReason   string
 	}{
 		{
 			name: "no matching pods is unavailable",
@@ -1032,6 +1103,7 @@ func TestRouter_HandlerFunc_InferencePoolPodDiscovery(t *testing.T) {
 			},
 			expectedStatus:   http.StatusServiceUnavailable,
 			expectedResponse: "no available pods for inference pool",
+			expectedReason:   "pod_discovery",
 		},
 		{
 			name: "invalid selector is an internal error",
@@ -1040,6 +1112,14 @@ func TestRouter_HandlerFunc_InferencePoolPodDiscovery(t *testing.T) {
 			},
 			expectedStatus:   http.StatusInternalServerError,
 			expectedResponse: "failed to get pods for inference pool",
+			expectedReason:   "pod_discovery",
+		},
+		{
+			name:             "pool deleted during pod lookup is not found",
+			deleteDuringRead: true,
+			expectedStatus:   http.StatusNotFound,
+			expectedResponse: "can't find inference pool",
+			expectedReason:   "inference_pool_discovery",
 		},
 	}
 
@@ -1083,7 +1163,17 @@ func TestRouter_HandlerFunc_InferencePoolPodDiscovery(t *testing.T) {
 			}
 			assert.NoError(t, store.AddOrUpdateHTTPRoute(httpRoute))
 			assert.NoError(t, store.AddOrUpdateInferencePool(inferencePool))
+			if tt.deleteDuringRead {
+				router.store = &inferencePoolDeletedStore{
+					Store:         store,
+					inferencePool: inferencePool,
+				}
+			}
 
+			requestsBefore := requestCounterValue(
+				t, router, metrics.UnknownModel, "/custom",
+				strconv.Itoa(tt.expectedStatus), tt.expectedReason,
+			)
 			w := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(w)
 			c.Set(GatewayKey, "default/gw")
@@ -1097,6 +1187,10 @@ func TestRouter_HandlerFunc_InferencePoolPodDiscovery(t *testing.T) {
 
 			assert.Equal(t, tt.expectedStatus, w.Code)
 			assert.Contains(t, w.Body.String(), tt.expectedResponse)
+			assert.Equal(t, float64(1), requestCounterValue(
+				t, router, metrics.UnknownModel, "/custom",
+				strconv.Itoa(tt.expectedStatus), tt.expectedReason,
+			)-requestsBefore)
 		})
 	}
 }

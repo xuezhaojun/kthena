@@ -29,6 +29,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -42,6 +43,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 
+	inferencev1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
@@ -93,6 +95,36 @@ func setupTestRouter(t *testing.T, backendHandler http.Handler) (*Router, datast
 	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
 
 	return router, store, backend
+}
+
+type modelServerDeletedStore struct {
+	datastore.Store
+	modelServer *aiv1alpha1.ModelServer
+}
+
+func (s *modelServerDeletedStore) GetModelServer(types.NamespacedName) *aiv1alpha1.ModelServer {
+	return s.modelServer
+}
+
+func (s *modelServerDeletedStore) GetPodsByModelServer(name types.NamespacedName) ([]*datastore.PodInfo, error) {
+	return nil, fmt.Errorf("model server not found: %v", name)
+}
+
+type inferencePoolDeletedStore struct {
+	datastore.Store
+	inferencePool *inferencev1.InferencePool
+	getCalls      atomic.Int32
+}
+
+func (s *inferencePoolDeletedStore) GetInferencePool(string) *inferencev1.InferencePool {
+	if s.getCalls.Add(1) == 1 {
+		return s.inferencePool
+	}
+	return nil
+}
+
+func (s *inferencePoolDeletedStore) GetPodsByInferencePool(name types.NamespacedName) ([]*datastore.PodInfo, error) {
+	return nil, fmt.Errorf("inferencepool not found: %v", name)
 }
 
 func TestRouter_HandleHTTPRoute_PathPrefix(t *testing.T) {
@@ -889,6 +921,45 @@ func requestCounterValue(t *testing.T, router *Router, model, path, statusCode, 
 	return metric.GetCounter().GetValue()
 }
 
+func TestRequestFinishReason(t *testing.T) {
+	tests := []struct {
+		name           string
+		status         int
+		explicitReason string
+		expectedReason string
+	}{
+		{
+			name:           "successful response",
+			status:         http.StatusOK,
+			expectedReason: successfulRequestFinishReason,
+		},
+		{
+			name:           "unclassified error response",
+			status:         http.StatusServiceUnavailable,
+			expectedReason: failedRequestFinishReason,
+		},
+		{
+			name:           "explicit reason takes precedence",
+			status:         http.StatusServiceUnavailable,
+			explicitReason: "pod_discovery",
+			expectedReason: "pod_discovery",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Status(tt.status)
+			if tt.explicitReason != "" {
+				c.Set("finishReason", tt.explicitReason)
+			}
+
+			assert.Equal(t, tt.expectedReason, requestFinishReason(c))
+		})
+	}
+}
+
 func TestRouter_HandlerFunc_UnknownModelMetricsUseBoundedLabel(t *testing.T) {
 	router, _, backend := setupTestRouter(t, nil)
 	defer backend.Close()
@@ -911,6 +982,234 @@ func TestRouter_HandlerFunc_UnknownModelMetricsUseBoundedLabel(t *testing.T) {
 
 	assert.Equal(t, 0, countMetricsWithModelPrefix(t, prefix))
 	assert.Equal(t, float64(3), requestCounterValue(t, router, metrics.UnknownModel, "/v1/chat/completions", "404", "route_not_found")-requestsBefore)
+}
+
+func TestRouter_HandlerFunc_BackendUnavailable(t *testing.T) {
+	tests := []struct {
+		name             string
+		addModelServer   bool
+		addPod           bool
+		expectedStatus   int
+		expectedResponse string
+		expectedReason   string
+	}{
+		{
+			name:             "missing model server remains not found",
+			expectedStatus:   http.StatusNotFound,
+			expectedResponse: "can't find model server",
+			expectedReason:   "pod_discovery",
+		},
+		{
+			name:             "model server without pods is unavailable",
+			addModelServer:   true,
+			expectedStatus:   http.StatusServiceUnavailable,
+			expectedResponse: "no available pods for model server",
+			expectedReason:   "pod_discovery",
+		},
+		{
+			name:             "all backend requests fail",
+			addModelServer:   true,
+			addPod:           true,
+			expectedStatus:   http.StatusServiceUnavailable,
+			expectedResponse: "request to all pods failed",
+			expectedReason:   "proxy",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			backendHandler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusServiceUnavailable)
+			})
+			router, store, backend := setupTestRouter(t, backendHandler)
+			defer backend.Close()
+
+			backendURL, err := url.Parse(backend.URL)
+			assert.NoError(t, err)
+			backendPort, err := strconv.Atoi(backendURL.Port())
+			assert.NoError(t, err)
+
+			modelServer := &aiv1alpha1.ModelServer{
+				ObjectMeta: v1.ObjectMeta{Name: "ms-unavailable", Namespace: "default"},
+				Spec: aiv1alpha1.ModelServerSpec{
+					Model:        func(s string) *string { return &s }("base-model"),
+					WorkloadPort: aiv1alpha1.WorkloadPort{Port: int32(backendPort)},
+				},
+			}
+			modelRoute := &aiv1alpha1.ModelRoute{
+				ObjectMeta: v1.ObjectMeta{Name: "mr-unavailable", Namespace: "default"},
+				Spec: aiv1alpha1.ModelRouteSpec{
+					ModelName: "unavailable-model",
+					Rules: []*aiv1alpha1.Rule{
+						{TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: modelServer.Name}}},
+					},
+				},
+			}
+
+			if tt.addModelServer {
+				podNames := sets.New[types.NamespacedName]()
+				var pod *corev1.Pod
+				if tt.addPod {
+					podName := types.NamespacedName{Name: "pod-unavailable", Namespace: "default"}
+					podNames.Insert(podName)
+					pod = &corev1.Pod{
+						ObjectMeta: v1.ObjectMeta{Name: podName.Name, Namespace: podName.Namespace},
+						Status:     corev1.PodStatus{PodIP: backendURL.Hostname(), Phase: corev1.PodRunning},
+					}
+				}
+				store.AddOrUpdateModelServer(modelServer, podNames)
+				if pod != nil {
+					store.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{modelServer})
+				}
+			}
+			store.AddOrUpdateModelRoute(modelRoute)
+
+			requestsBefore := requestCounterValue(
+				t, router, "unavailable-model", "/v1/chat/completions",
+				strconv.Itoa(tt.expectedStatus), tt.expectedReason,
+			)
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			requestBody := `{"model":"unavailable-model","prompt":"hello"}`
+			c.Request, err = http.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(requestBody))
+			assert.NoError(t, err)
+			c.Request.Header.Set("Content-Type", "application/json")
+
+			router.HandlerFunc()(c)
+
+			assert.Equal(t, tt.expectedStatus, w.Code)
+			assert.Contains(t, w.Body.String(), tt.expectedResponse)
+			assert.Equal(t, float64(1), requestCounterValue(
+				t, router, "unavailable-model", "/v1/chat/completions",
+				strconv.Itoa(tt.expectedStatus), tt.expectedReason,
+			)-requestsBefore)
+		})
+	}
+}
+
+func TestRouter_HandlerFunc_InferencePoolPodDiscovery(t *testing.T) {
+	tests := []struct {
+		name             string
+		matchLabels      map[inferencev1.LabelKey]inferencev1.LabelValue
+		deleteDuringRead bool
+		expectedStatus   int
+		expectedResponse string
+		expectedReason   string
+	}{
+		{
+			name: "no matching pods is unavailable",
+			matchLabels: map[inferencev1.LabelKey]inferencev1.LabelValue{
+				"app": "missing",
+			},
+			expectedStatus:   http.StatusServiceUnavailable,
+			expectedResponse: "no available pods for inference pool",
+			expectedReason:   "pod_discovery",
+		},
+		{
+			name: "invalid selector is an internal error",
+			matchLabels: map[inferencev1.LabelKey]inferencev1.LabelValue{
+				"invalid key": "value",
+			},
+			expectedStatus:   http.StatusInternalServerError,
+			expectedResponse: "failed to get pods for inference pool",
+			expectedReason:   "pod_discovery",
+		},
+		{
+			name:             "pool deleted during pod lookup is not found",
+			deleteDuringRead: true,
+			expectedStatus:   http.StatusNotFound,
+			expectedResponse: "can't find inference pool",
+			expectedReason:   "inference_pool_discovery",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			router, store, backend := setupTestRouter(t, nil)
+			defer backend.Close()
+
+			pathType := gatewayv1.PathMatchPathPrefix
+			pathValue := "/"
+			gatewayKind := gatewayv1.Kind("Gateway")
+			poolGroup := inferencePoolBackendGroup
+			poolKind := inferencePoolBackendKind
+			httpRoute := &gatewayv1.HTTPRoute{
+				ObjectMeta: v1.ObjectMeta{Name: "route-unavailable", Namespace: "default"},
+				Spec: gatewayv1.HTTPRouteSpec{
+					CommonRouteSpec: gatewayv1.CommonRouteSpec{
+						ParentRefs: []gatewayv1.ParentReference{{Name: "gw", Kind: &gatewayKind}},
+					},
+					Rules: []gatewayv1.HTTPRouteRule{{
+						Matches: []gatewayv1.HTTPRouteMatch{{
+							Path: &gatewayv1.HTTPPathMatch{Type: &pathType, Value: &pathValue},
+						}},
+						BackendRefs: []gatewayv1.HTTPBackendRef{{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Group: &poolGroup,
+									Kind:  &poolKind,
+									Name:  "pool-unavailable",
+								},
+							},
+						}},
+					}},
+				},
+			}
+			inferencePool := &inferencev1.InferencePool{
+				ObjectMeta: v1.ObjectMeta{Name: "pool-unavailable", Namespace: "default"},
+				Spec: inferencev1.InferencePoolSpec{
+					Selector: inferencev1.LabelSelector{MatchLabels: tt.matchLabels},
+				},
+			}
+			assert.NoError(t, store.AddOrUpdateHTTPRoute(httpRoute))
+			assert.NoError(t, store.AddOrUpdateInferencePool(inferencePool))
+			if tt.deleteDuringRead {
+				router.store = &inferencePoolDeletedStore{
+					Store:         store,
+					inferencePool: inferencePool,
+				}
+			}
+
+			requestsBefore := requestCounterValue(
+				t, router, metrics.UnknownModel, "/custom",
+				strconv.Itoa(tt.expectedStatus), tt.expectedReason,
+			)
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Set(GatewayKey, "default/gw")
+			requestBody := `{"model":"inference-model","prompt":"hello"}`
+			var err error
+			c.Request, err = http.NewRequest(http.MethodPost, "/custom", bytes.NewBufferString(requestBody))
+			assert.NoError(t, err)
+			c.Request.Header.Set("Content-Type", "application/json")
+
+			router.HandlerFunc()(c)
+
+			assert.Equal(t, tt.expectedStatus, w.Code)
+			assert.Contains(t, w.Body.String(), tt.expectedResponse)
+			assert.Equal(t, float64(1), requestCounterValue(
+				t, router, metrics.UnknownModel, "/custom",
+				strconv.Itoa(tt.expectedStatus), tt.expectedReason,
+			)-requestsBefore)
+		})
+	}
+}
+
+func TestRouter_GetPodsAndServer_ModelServerDeletedDuringPodLookup(t *testing.T) {
+	modelServerName := types.NamespacedName{Name: "deleted", Namespace: "default"}
+	modelServer := &aiv1alpha1.ModelServer{
+		ObjectMeta: v1.ObjectMeta{Name: modelServerName.Name, Namespace: modelServerName.Namespace},
+	}
+	router := &Router{store: &modelServerDeletedStore{
+		Store:       datastore.New(),
+		modelServer: modelServer,
+	}}
+
+	pods, foundModelServer, err := router.getPodsAndServer(modelServerName)
+
+	assert.Error(t, err)
+	assert.Nil(t, pods)
+	assert.Nil(t, foundModelServer)
 }
 
 func TestRouter_HandlerFunc_ScheduleFailure(t *testing.T) {
